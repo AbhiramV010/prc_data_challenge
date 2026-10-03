@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -249,6 +250,70 @@ class TestEndToEnd(unittest.TestCase):
         r = run_cli("upload", str(tpl), "--as", "team_v1.parquet", root=self.root)
         self.assertNotEqual(r.returncode, 0)  # template target column is all null
         self.assertIn("Not uploading", r.stderr)
+
+
+DATA = ROOT / "data"
+HAS_DATA = (DATA / "ranking.parquet").exists() and (DATA / "submitting.parquet").exists()
+
+
+@unittest.skipUnless(HAS_DATA, "competition data not downloaded (python prc.py download)")
+class TestCompetitionData(unittest.TestCase):
+    """Checks on the real files in data/. Outputs go to a temp folder, never artifacts/."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.template = pd.read_parquet(DATA / "submitting.parquet")
+        rank = pd.read_parquet(DATA / "ranking.parquet",
+                               columns=[prc.ID, "PHASE_mvt", prc.TARGET, "BLOCK_TIME_UTC_mvt"])
+        cls.rank_deps = rank[rank["PHASE_mvt"].eq("DEP")]
+
+    def test_all_files_present(self):
+        self.assertEqual(len(prc.training_files(DATA)), 12)
+
+    def test_template_ids_are_exactly_the_ranking_departures(self):
+        tid = self.template[prc.ID]
+        self.assertFalse(tid.duplicated().any())
+        self.assertEqual(set(tid), set(self.rank_deps[prc.ID]))
+        self.assertEqual(len(tid), len(self.rank_deps))
+
+    def test_ranking_departure_targets_are_blanked(self):
+        self.assertTrue(self.rank_deps[prc.TARGET].isna().all())
+        self.assertTrue(self.rank_deps["BLOCK_TIME_UTC_mvt"].isna().all())
+
+    def test_training_target_is_takeoff_minus_offblock(self):
+        f = prc.training_files(DATA)[0]
+        d = pd.read_parquet(f, columns=["PHASE_mvt", prc.TARGET, "MVT_TIME_UTC_mvt",
+                                        "BLOCK_TIME_UTC_mvt"])
+        d = d[d["PHASE_mvt"].eq("DEP")]
+        implied = prc.to_secs(prc.to_utc(d["MVT_TIME_UTC_mvt"])) - prc.to_secs(
+            prc.to_utc(d["BLOCK_TIME_UTC_mvt"]))
+        self.assertGreater(((implied - d[prc.TARGET]).abs() <= 1).mean(), 0.999)
+
+    def test_existing_submission_files_are_valid(self):
+        files = sorted((ROOT / "submissions").glob("*_v*.parquet"))
+        if not files:
+            self.skipTest("no submission files yet")
+        for f in files:
+            with self.subTest(file=f.name):
+                out = pd.read_parquet(f)
+                self.assertEqual(list(out.columns), list(self.template.columns))
+                np.testing.assert_array_equal(out[prc.ID].to_numpy(), self.template[prc.ID].to_numpy())
+                self.assertFalse(out[prc.TARGET].isna().any())
+                self.assertTrue((out[prc.TARGET] >= 0).all())
+
+    def test_validate_on_competition_data(self):
+        """Fast validation (30% of rows) on Jan + Jul 2025; takes a few minutes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            r = run_cli("--data", str(DATA), "validate", "--fast", "--use-actual-obt", root=tmp)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        lines = [line for line in r.stdout.splitlines() if line.startswith("RMSE")]
+        print("\nCompetition-data (fast) " + "\n".join(lines), file=sys.stderr)
+
+        m = re.search(r"RMSE clean .*model ([\d.]+) .*baseline ([\d.]+)", r.stdout)
+        assert m, r.stdout
+        model, baseline = float(m.group(1)), float(m.group(2))
+        self.assertLess(model, baseline)
+        self.assertLess(model, 260)  # fast run scored 227.8; guards against regressions
 
 
 if __name__ == "__main__":

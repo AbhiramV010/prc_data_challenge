@@ -43,9 +43,10 @@ ARR_WINDOWS = [("arr_pm15", -900, "left", 900, "right"),
                ("arr_pm30", -1800, "left", 1800, "right")]
 
 
-def paths(root):
-    root = Path(root)
-    return root / "data", root / "artifacts", root / "submissions"
+def paths(args):
+    root = Path(args.root)
+    data = Path(args.data) if getattr(args, "data", None) else root / "data"
+    return data, root / "artifacts", root / "submissions"
 
 
 def training_files(data):
@@ -95,7 +96,7 @@ def cmd_download(args):
     from minio import Minio
     from minio.error import S3Error
 
-    data, _, _ = paths(args.root)
+    data, _, _ = paths(args)
     data.mkdir(parents=True, exist_ok=True)
     access, secret = minio_keys()
     client = Minio(ENDPOINT, access_key=access, secret_key=secret, secure=True)
@@ -145,7 +146,7 @@ def cmd_upload(args):
     m = re.fullmatch(r"(.+)_v\d+\.parquet", key)
     if not m:
         sys.exit(f"{key} does not follow <team-name>_v<N>.parquet. Use --as NAME.")
-    data, _, _ = paths(args.root)
+    data, _, _ = paths(args)
     sub, tpl = pd.read_parquet(path), pd.read_parquet(single_file(data, "submitting"))
     if (list(sub.columns) != list(tpl.columns) or len(sub) != len(tpl)
             or not (sub[ID].to_numpy() == tpl[ID].to_numpy()).all() or sub[TARGET].isna().any()):
@@ -343,7 +344,7 @@ def encode_cats(X, fit_mask):
 
 
 def prepare(args):
-    data, _, _ = paths(args.root)
+    data, _, _ = paths(args)
     dep, events = load(data, args.use_actual_obt)
     X = build_features(dep, events, args.use_actual_obt)
     del events
@@ -387,7 +388,7 @@ def rmse(a, b):
 
 def cmd_validate(args):
     dep, X = prepare(args)
-    _, art, _ = paths(args.root)
+    _, art, _ = paths(args)
     is_train = dep["split"].eq("train")
     hold = dep["month"].isin([1, 7])
     fm = fit_rows(dep, is_train & ~hold, args.fast, args.max_target)
@@ -429,7 +430,7 @@ def cmd_validate(args):
 
 
 def cmd_submit(args):
-    data, art, subs = paths(args.root)
+    data, art, subs = paths(args)
     template = pd.read_parquet(single_file(data, "submitting"))
     dep, X = prepare(args)
     fm = fit_rows(dep, dep["split"].eq("train"), args.fast, args.max_target)
@@ -469,7 +470,7 @@ def cmd_submit(args):
 
 
 def cmd_audit(args):
-    data, _, _ = paths(args.root)
+    data, _, _ = paths(args)
     files = [("train", f) for f in training_files(data)] + [("rank", single_file(data, "ranking"))]
     counts, nonnull, ndep = {}, {"train": {}, "rank": {}}, {"train": 0, "rank": 0}
     taxi, seen, rank_keys, apt_check = [], {}, [], []
@@ -536,7 +537,7 @@ def cmd_audit(args):
 
 
 def cmd_synth(args):
-    data, _, _ = paths(args.root)
+    data, _, _ = paths(args)
     data.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(0)
     next_id = [1]
@@ -590,6 +591,7 @@ def cmd_synth(args):
 def main():
     p = argparse.ArgumentParser(description="PRC Data Challenge 2026: taxi-out time prediction.")
     p.add_argument("--root", default=".", help="folder holding data/, artifacts/, submissions/")
+    p.add_argument("--data", help="data folder (default: ROOT/data)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("download")
