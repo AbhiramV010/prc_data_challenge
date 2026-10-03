@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+credentials.json
+instruction.md
+# PRC challenge
+data/
+submissions/
+artifacts/
