@@ -1,3 +1,5 @@
+import csv
+import json
 import os
 import re
 import subprocess
@@ -119,7 +121,7 @@ def tiny_departures():
         "FLIGHT_RULE_mvt": s(["I"] * n), "FLIGHT_RULE_flt": s(["I"] * n),
         "WK_TBL_CAT_flt": s(["M"] * n), "MARKET_SEGMENT_flt": s(["Mainline"] * n),
         "AIRCRAFT_OPERATOR_flt": s(["OP1"] * n), "FLIGHT_TYPE_flt": s(["S"] * n),
-        "hour": [0.0] * n, "dow": [0] * n,
+        "hour": [0.0] * n, "dow": [0] * n, "unmatched": [0.0, 1.0, 0.0],
         "t": [600.0, 700.0, 1000.0], "obt": [0.0, 100.0, 650.0],
         "SCHED_TIME_UTC_mvt": [0.0] * n, "EOBT_1_flt": [0.0] * n, "IOBT_flt": [0.0] * n,
         "AOBT_3_flt": [0.0] * n, "LOBT_flt": [0.0] * n,
@@ -174,11 +176,29 @@ class TestModelHelpers(unittest.TestCase):
         self.assertEqual(list(col.cat.categories), ["x"])
         self.assertTrue(col.iloc[40:].isna().all())
 
-    def test_fit_rows_filters_targets(self):
-        dep = pd.DataFrame({prc.TARGET: [np.nan, -5.0, 0.0, 600.0, 3600.0, 3601.0]})
-        mask = pd.Series([True] * 6)
-        np.testing.assert_array_equal(prc.fit_rows(dep, mask, False, 3600),
-                                      [False, False, False, True, True, False])
+    def test_fit_masks(self):
+        dep = pd.DataFrame({prc.TARGET: [np.nan, -5.0, 0.0, 600.0, 3600.0, 3601.0, 900.0, 700.0],
+                            "stale": [np.nan, 0, 0, 0, 0, 0, 1, np.nan]})
+        reg, labelled = prc.fit_masks(dep, pd.Series([True] * 8), False, 3600)
+        # Regressor: normal (non-stale) rows with 0 < y <= max_target.
+        np.testing.assert_array_equal(reg, [False, False, False, True, True, False, False, False])
+        # Classifier: every row with a target and a stale label.
+        np.testing.assert_array_equal(labelled, [False, True, True, True, True, True, True, False])
+
+    def test_predict_mix(self):
+        class Fixed:
+            def __init__(self, values):
+                self.values = np.array(values, dtype=float)
+
+            def predict(self, X):
+                return self.values
+
+        X = pd.DataFrame({"mvt_minus_sched": [1000.0, 5000.0, np.nan, -100.0]})
+        models = {"stale": Fixed([0.0, 1.0, 0.5, 1.0]), "reg": Fixed([800.0, 800.0, 700.0, -50.0])}
+        pred, _, normal = prc.predict_mix(models, X)
+        # Stale rows take takeoff - scheduled; no schedule falls back to the normal model.
+        np.testing.assert_array_equal(pred, [800.0, 5000.0, 700.0, 0.0])
+        np.testing.assert_array_equal(normal, [800.0, 800.0, 700.0, 0.0])
 
     def test_rmse(self):
         self.assertAlmostEqual(prc.rmse([0, 0], [3, 4]), np.sqrt(12.5))
@@ -195,6 +215,44 @@ class TestModelHelpers(unittest.TestCase):
 def run_cli(*args, root):
     return subprocess.run([sys.executable, str(ROOT / "prc.py"), "--root", str(root), *args],
                           capture_output=True, text=True, cwd=root, check=False)
+
+
+RESULTS_CSV = ROOT / "results.csv"
+RESULT_FIELDS = ["run_at", "dataset", "rows_clean", "model_rmse_clean", "baseline_rmse_clean",
+                 "model_rmse_all", "baseline_rmse_all", "best_iter"]
+RMSE_REPORT: list[str] = []
+RMSE_RESULTS: list[dict] = []
+
+
+def report_rmse(label, stdout):
+    """Keep validate's RMSE lines for the summary and results.csv written after all tests."""
+    RMSE_REPORT.append(label)
+    RMSE_REPORT.extend("  " + line for line in stdout.splitlines() if line.startswith("RMSE"))
+    clean = re.search(r"RMSE clean \(.*?([\d,]+) rows\): model ([\d.]+)\s+\|\s+airport-mean "
+                      r"baseline ([\d.]+)", stdout)
+    every = re.search(r"RMSE all rows: model ([\d.]+)\s+\|\s+baseline ([\d.]+)\s+\|\s+best_iter (\d+)",
+                      stdout)
+    if clean and every:
+        RMSE_RESULTS.append({
+            "dataset": label, "rows_clean": int(clean.group(1).replace(",", "")),
+            "model_rmse_clean": float(clean.group(2)), "baseline_rmse_clean": float(clean.group(3)),
+            "model_rmse_all": float(every.group(1)), "baseline_rmse_all": float(every.group(2)),
+            "best_iter": int(every.group(3)),
+        })
+
+
+def tearDownModule():
+    if RMSE_REPORT:
+        print("\n\nRMSE summary\n" + "\n".join(RMSE_REPORT), file=sys.stderr)
+    if RMSE_RESULTS:
+        run_at = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+        new = not RESULTS_CSV.exists() or RESULTS_CSV.stat().st_size == 0
+        with RESULTS_CSV.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=RESULT_FIELDS)
+            if new:
+                writer.writeheader()
+            writer.writerows({"run_at": run_at, **row} for row in RMSE_RESULTS)
+        print(f"Results appended to {RESULTS_CSV}", file=sys.stderr)
 
 
 class TestEndToEnd(unittest.TestCase):
@@ -215,9 +273,9 @@ class TestEndToEnd(unittest.TestCase):
         r = run_cli("validate", "--fast", "--use-actual-obt", root=self.root)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("RMSE clean", r.stdout)
-        print("\nSynthetic-data " + "\n".join(
-            line for line in r.stdout.splitlines() if line.startswith("RMSE")), file=sys.stderr)
-        self.assertTrue((self.root / "artifacts" / "best_iter.txt").exists())
+        report_rmse("Synthetic test data (fake; only shows the pipeline works)", r.stdout)
+        best = json.loads((self.root / "artifacts" / "best_iter.json").read_text())
+        self.assertEqual(set(best), {"reg", "stale"})
 
         r = run_cli("submit", "--name", "team", "--fast", "--use-actual-obt", root=self.root)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -227,6 +285,19 @@ class TestEndToEnd(unittest.TestCase):
         np.testing.assert_array_equal(out[prc.ID].to_numpy(), tpl[prc.ID].to_numpy())
         self.assertFalse(out[prc.TARGET].isna().any())
         self.assertTrue((out[prc.TARGET] >= 0).all())
+
+    def test_load_labels_stale_blocks_on_training_rows_only(self):
+        dep, _ = prc.load(self.root / "data")
+        train, rank = dep[dep["split"].eq("train")], dep[dep["split"].eq("rank")]
+        self.assertTrue(rank["stale"].isna().all())  # ranking block times are blank
+        self.assertTrue(train["stale"].isin([0.0, 1.0]).all())
+        f = prc.training_files(self.root / "data")[0]
+        raw = pd.read_parquet(f)
+        raw = raw[raw["PHASE_mvt"].eq("DEP")]
+        gap = (raw["BLOCK_TIME_UTC_mvt"] - raw["SCHED_TIME_UTC_mvt"]).dt.total_seconds().abs()
+        loaded = train[train[prc.ID].isin(raw[prc.ID])]
+        self.assertAlmostEqual(loaded["stale"].mean(), (gap <= prc.STALE_SEC).mean())
+        self.assertTrue(dep["unmatched"].eq(0).all())  # synthetic flights all have FLIGHT_ID
 
     def test_submit_aborts_on_unknown_template_id(self):
         root = self.root / "bad"
@@ -306,8 +377,7 @@ class TestCompetitionData(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             r = run_cli("--data", str(DATA), "validate", "--fast", "--use-actual-obt", root=tmp)
         self.assertEqual(r.returncode, 0, r.stderr[-2000:])
-        lines = [line for line in r.stdout.splitlines() if line.startswith("RMSE")]
-        print("\nCompetition-data (fast) " + "\n".join(lines), file=sys.stderr)
+        report_rmse("Competition data (fast run, 30% of training rows)", r.stdout)
 
         m = re.search(r"RMSE clean .*model ([\d.]+) .*baseline ([\d.]+)", r.stdout)
         assert m, r.stdout

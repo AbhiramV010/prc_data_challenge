@@ -1,0 +1,3 @@
+run_at,dataset,rows_clean,model_rmse_clean,baseline_rmse_clean,model_rmse_all,baseline_rmse_all,best_iter
+2026-10-02 23:38:57,"Competition data (fast run, 30% of training rows)",343355,227.8,376.19,577.31,661.2,173
+2026-10-02 23:38:57,Synthetic test data (fake; only shows the pipeline works),1536,18.23,122.13,18.23,122.13,48

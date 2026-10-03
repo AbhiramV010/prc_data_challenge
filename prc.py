@@ -1,9 +1,3 @@
-"""PRC Data Challenge 2026: taxi-out time prediction.
-
-Subcommands: download, audit, validate, submit, synth (synthetic data for testing).
-Requires: pip install minio pandas pyarrow lightgbm numpy
-"""
-
 import argparse
 import json
 import os
@@ -33,6 +27,9 @@ STR_COLS = [
 CAT_FEATS = ["airport", "apt_rwy", "apt_stand", "actype", "dest", "rule", "wake",
              "market", "operator", "ftype"]
 MIN_CAT_COUNT = 30
+# |off-block - scheduled| at or below this means the airport logged the schedule as off-block,
+# so the target is simply takeoff minus scheduled time.
+STALE_SEC = 60
 
 # (name, lo offset s, lo side, hi offset s, hi side); searchsorted sides set open/closed bounds
 DEP_WINDOWS = [("dep_prev10", -600, "left", 0, "left"),
@@ -199,7 +196,7 @@ def reporting_airport(df, is_dep):
 def load(data: Path, use_obt=False) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Departures (train + ranking) with raw fields, and all movements as traffic events."""
     time_cols = TIME_COLS + OBT_COLS
-    cols = [ID, TARGET, "BLOCK_TIME_UTC_mvt"] + STR_COLS + time_cols
+    cols = [ID, TARGET, "BLOCK_TIME_UTC_mvt", "FLIGHT_ID_mvt"] + STR_COLS + time_cols
     files = [("train", f) for f in training_files(data)] + [("rank", single_file(data, "ranking"))]
     deps, events = [], []
     for split, path in files:
@@ -225,9 +222,14 @@ def load(data: Path, use_obt=False) -> tuple[pd.DataFrame, pd.DataFrame]:
         for c in STR_COLS:
             d[c] = d[c].astype("string")
         d[TARGET] = pd.to_numeric(d[TARGET], errors="coerce")
+        blk = to_secs(to_utc(d["BLOCK_TIME_UTC_mvt"]))
+        gap = (blk - d["SCHED_TIME_UTC_mvt"]).abs()
+        d["stale"] = np.where(gap.notna(), (gap <= STALE_SEC).astype(float), np.nan)
+        d["unmatched"] = d["FLIGHT_ID_mvt"].isna().astype(float)
         d["split"] = split
         d["obt"] = obt[is_dep]
-        deps.append(d.drop(columns=["MVT_TIME_UTC_mvt", "PHASE_mvt", "BLOCK_TIME_UTC_mvt"]))
+        deps.append(d.drop(columns=["MVT_TIME_UTC_mvt", "PHASE_mvt", "BLOCK_TIME_UTC_mvt",
+                                    "FLIGHT_ID_mvt"]))
         print(f"loaded {path.name}: {len(df):,} rows, {int(is_dep.sum()):,} departures")
         del df
     return pd.concat(deps, ignore_index=True), pd.concat(events, ignore_index=True)
@@ -298,6 +300,7 @@ def build_features(dep, events, use_obt=False):
     X["ftype"] = dep["FLIGHT_TYPE_flt"]
 
     X["hour"], X["dow"] = dep["hour"], dep["dow"]
+    X["unmatched"] = dep["unmatched"]
     X["mvt_minus_sched"] = dep["t"] - dep["SCHED_TIME_UTC_mvt"]
     X["mvt_minus_eobt1"] = dep["t"] - dep["EOBT_1_flt"]
     X["mvt_minus_iobt"] = dep["t"] - dep["IOBT_flt"]
@@ -351,35 +354,50 @@ def prepare(args):
     return dep, X
 
 
-def lgb_params(fast):
-    return {"objective": "regression", "metric": "rmse", "learning_rate": 0.1 if fast else 0.05,
+def lgb_params(fast, objective="regression"):
+    metric = "rmse" if objective == "regression" else "binary_logloss"
+    return {"objective": objective, "metric": metric, "learning_rate": 0.1 if fast else 0.05,
             "num_leaves": 127 if fast else 255, "min_data_in_leaf": 100, "feature_fraction": 0.8,
             "bagging_fraction": 0.8, "bagging_freq": 1, "lambda_l2": 1.0, "cat_smooth": 20,
             "cat_l2": 10, "max_cat_threshold": 64, "verbose": -1, "seed": 0}
 
 
-def fit(X, y, rounds, fast, Xv=None, yv=None):
+def fit(X, y, rounds, fast, Xv=None, yv=None, objective="regression"):
     import lightgbm as lgb
-    y = y.clip(upper=np.percentile(y, 99.9))
     dtr = lgb.Dataset(X, y, categorical_feature=CAT_FEATS, free_raw_data=True)
+    params = lgb_params(fast, objective)
     if Xv is None:
-        return lgb.train(lgb_params(fast), dtr, rounds,
-                         callbacks=[lgb.log_evaluation(0)])
+        return lgb.train(params, dtr, rounds, callbacks=[lgb.log_evaluation(0)])
     dv = lgb.Dataset(Xv, yv, reference=dtr)
-    return lgb.train(lgb_params(fast), dtr, rounds, valid_sets=[dv], valid_names=["valid"],
+    return lgb.train(params, dtr, rounds, valid_sets=[dv], valid_names=["valid"],
                      callbacks=[lgb.early_stopping(100), lgb.log_evaluation(200)])
 
 
-def fit_rows(dep, mask, fast, max_target):
-    mask = mask & dep[TARGET].notna() & (dep[TARGET] > 0) & (dep[TARGET] <= max_target)
+def fit_masks(dep, mask, fast, max_target):
+    """Rows for the normal-taxi regressor and for the stale-block classifier."""
+    labelled = mask & dep["stale"].notna() & dep[TARGET].notna()
     if fast:
-        rng = np.random.default_rng(0)
-        mask &= rng.random(len(dep)) < 0.3
-    return mask.to_numpy()
+        labelled &= np.random.default_rng(0).random(len(dep)) < 0.3
+    reg = labelled & dep["stale"].eq(0) & (dep[TARGET] > 0) & (dep[TARGET] <= max_target)
+    return reg.to_numpy(), labelled.to_numpy()
 
 
-def predict(model, X, **kw):
-    return np.asarray(model.predict(X, **kw), dtype=float).clip(min=0)
+def predict_mix(models, X):
+    """Expected taxi-out: P(stale) * (takeoff - scheduled) + (1 - P(stale)) * normal taxi."""
+    p = np.asarray(models["stale"].predict(X), dtype=float)
+    normal = np.asarray(models["reg"].predict(X), dtype=float)
+    ms = X["mvt_minus_sched"].to_numpy(float)
+    mix = np.where(np.isnan(ms), normal, p * np.clip(np.nan_to_num(ms), 0, None) + (1 - p) * normal)
+    return np.clip(mix, 0, None), p, np.clip(normal, 0, None)
+
+
+def fit_both(X, y, stale, reg_m, stale_m, rounds, fast, reg_v=None, stale_v=None):
+    ev = reg_v is not None and stale_v is not None
+    reg = fit(X.loc[reg_m], y.loc[reg_m], rounds["reg"], fast,
+              X.loc[reg_v] if ev else None, y.loc[reg_v] if ev else None)
+    stl = fit(X.loc[stale_m], stale.loc[stale_m], rounds["stale"], fast,
+              X.loc[stale_v] if ev else None, stale.loc[stale_v] if ev else None, "binary")
+    return {"reg": reg, "stale": stl}
 
 
 def rmse(a, b):
@@ -391,59 +409,77 @@ def cmd_validate(args):
     _, art, _ = paths(args)
     is_train = dep["split"].eq("train")
     hold = dep["month"].isin([1, 7])
-    fm = fit_rows(dep, is_train & ~hold, args.fast, args.max_target)
+    reg_m, stale_m = fit_masks(dep, is_train & ~hold, args.fast, args.max_target)
+    reg_v, stale_v = fit_masks(dep, is_train & hold, False, args.max_target)
     vm = (is_train & hold & dep[TARGET].notna()).to_numpy()
-    clean = (dep[TARGET] > 0) & (dep[TARGET] <= args.max_target)
-    cm = vm & clean.to_numpy()
     if not vm.any():
         sys.exit("No Jan/Jul 2025 departures with a target to validate on.")
-    X = encode_cats(X, fm)
+    X = encode_cats(X, stale_m)
     y = pd.Series(dep[TARGET], dtype=float)
-    print(f"fit rows {fm.sum():,}, validation rows {vm.sum():,}, features {X.shape[1]}")
+    stale = pd.Series(dep["stale"], dtype=float)
+    print(f"regressor rows {reg_m.sum():,}, classifier rows {stale_m.sum():,}, "
+          f"validation rows {vm.sum():,}, features {X.shape[1]}")
 
-    model = fit(X.loc[fm], y.loc[fm], 1500 if args.fast else 5000, args.fast, X.loc[cm], y.loc[cm])
-    pred = predict(model, X.loc[vm], num_iteration=model.best_iteration)
+    rounds = 1500 if args.fast else 5000
+    models = fit_both(X, y, stale, reg_m, stale_m, {"reg": rounds, "stale": rounds}, args.fast,
+                      reg_v, stale_v)
+    pred, p, normal = predict_mix(models, X.loc[vm])
     yv = y.loc[vm].to_numpy(float)
-    c = clean.to_numpy()[vm]
+    c = (yv > 0) & (yv <= args.max_target)
 
-    apt_mean = y.loc[fm].groupby(dep.loc[fm, "airport"]).mean()
-    base = dep.loc[vm, "airport"].map(apt_mean).fillna(y.loc[fm].mean()).to_numpy(float)
-    print(f"\nRMSE clean (0 < y <= {args.max_target:.0f}s, {c.sum():,} rows): "
+    fit_y = y.loc[stale_m]
+    apt_mean = fit_y.groupby(dep.loc[stale_m, "airport"]).mean()
+    base = dep.loc[vm, "airport"].map(apt_mean).fillna(fit_y.mean()).to_numpy(float)
+    print(f"\nRMSE all rows ({vm.sum():,}): model {rmse(pred, yv):.2f}  |  normal-taxi model only "
+          f"{rmse(normal, yv):.2f}  |  airport-mean baseline {rmse(base, yv):.2f}")
+    print(f"RMSE clean (0 < y <= {args.max_target:.0f}s, {c.sum():,} rows): "
           f"model {rmse(pred[c], yv[c]):.2f}  |  airport-mean baseline {rmse(base[c], yv[c]):.2f}")
-    print(f"RMSE all rows: model {rmse(pred, yv):.2f}  |  baseline {rmse(base, yv):.2f}"
-          f"  |  best_iter {model.best_iteration}")
+    sv = stale.loc[vm].to_numpy(float)
+    print(f"Stale-block share {np.nanmean(sv):.3f}; mean P(stale) when stale {p[sv == 1].mean():.3f}, "
+          f"when not {p[sv == 0].mean():.3f}")
 
-    per = pd.DataFrame({"airport": dep.loc[vm, "airport"].to_numpy(), "y": yv, "p": pred, "b": base})[c]
-    per["rmse"], per["baseline"] = (per.p - per.y) ** 2, (per.b - per.y) ** 2
-    tab = per.groupby("airport").agg(n=("y", "size"), rmse=("rmse", "mean"),
-                                     baseline=("baseline", "mean"))
-    tab[["rmse", "baseline"]] = np.sqrt(tab[["rmse", "baseline"]])
-    print("\nPer airport (clean rows):\n" + tab.round(1).to_string())
+    per = pd.DataFrame({"airport": dep.loc[vm, "airport"].to_numpy(), "y": yv, "p": pred, "b": base,
+                        "clean": c})
+    per["se"], per["se_b"] = (per.p - per.y) ** 2, (per.b - per.y) ** 2
+    tab = per.groupby("airport").agg(n=("y", "size"), rmse_all=("se", "mean"),
+                                     baseline_all=("se_b", "mean"))
+    tab["rmse_clean"] = per[per.clean].groupby("airport")["se"].mean()
+    tab[["rmse_all", "baseline_all", "rmse_clean"]] = np.sqrt(tab[["rmse_all", "baseline_all", "rmse_clean"]])
+    print("\nPer airport:\n" + tab.round(1).to_string())
 
-    imp = pd.Series(model.feature_importance("gain"), index=model.feature_name())
-    print("\nTop features (gain share):")
-    print((imp / imp.sum()).sort_values(ascending=False).head(25).round(4).to_string())
+    for name, key, k in [("normal-taxi regressor", "reg", 20), ("stale-block classifier", "stale", 10)]:
+        m = models[key]
+        imp = pd.Series(m.feature_importance("gain"), index=m.feature_name())
+        print(f"\nTop features, {name} (gain share):")
+        print((imp / imp.sum()).sort_values(ascending=False).head(k).round(4).to_string())
 
     art.mkdir(parents=True, exist_ok=True)
-    (art / "best_iter.txt").write_text(str(model.best_iteration))
-    print(f"\nSaved {art / 'best_iter.txt'}")
+    best = {k: m.best_iteration for k, m in models.items()}
+    (art / "best_iter.json").write_text(json.dumps(best))
+    print(f"\nSaved {art / 'best_iter.json'}: {best}")
 
 
 def cmd_submit(args):
     data, art, subs = paths(args)
     template = pd.read_parquet(single_file(data, "submitting"))
     dep, X = prepare(args)
-    fm = fit_rows(dep, dep["split"].eq("train"), args.fast, args.max_target)
+    reg_m, stale_m = fit_masks(dep, dep["split"].eq("train"), args.fast, args.max_target)
     rm = dep["split"].eq("rank").to_numpy()
-    X = encode_cats(X, fm)
+    X = encode_cats(X, stale_m)
 
-    rounds = args.rounds
-    if not rounds:
-        best = art / "best_iter.txt"
-        rounds = int(int(best.read_text()) * 1.1) if best.exists() else (600 if args.fast else 2000)
-    print(f"fit rows {fm.sum():,}, ranking departures {rm.sum():,}, rounds {rounds}")
-    model = fit(X.loc[fm], dep.loc[fm, TARGET], rounds, args.fast)
-    pred = pd.Series(predict(model, X.loc[rm]), index=dep.loc[rm, ID].astype(str).to_numpy())
+    best = art / "best_iter.json"
+    if args.rounds:
+        rounds = {"reg": args.rounds, "stale": args.rounds}
+    elif best.exists():
+        # More training rows than in validation, so train ~10% longer.
+        rounds = {k: max(int(v * 1.1), 50) for k, v in json.loads(best.read_text()).items()}
+    else:
+        rounds = {"reg": 600 if args.fast else 2000, "stale": 300 if args.fast else 1000}
+    print(f"regressor rows {reg_m.sum():,}, classifier rows {stale_m.sum():,}, "
+          f"ranking departures {rm.sum():,}, rounds {rounds}")
+    y = pd.Series(dep[TARGET], dtype=float)
+    models = fit_both(X, y, pd.Series(dep["stale"], dtype=float), reg_m, stale_m, rounds, args.fast)
+    pred = pd.Series(predict_mix(models, X.loc[rm])[0], index=dep.loc[rm, ID].astype(str).to_numpy())
 
     tid = template[ID].astype(str)
     if tid.duplicated().any():
@@ -580,7 +616,7 @@ def cmd_synth(args):
         month(2025, m, args.rows).to_parquet(data / f"training_2025-{m:02d}-01_synthetic.parquet")
     rank = pd.concat([month(2026, 1, args.rows), month(2026, 7, args.rows)], ignore_index=True)
     dep = rank["PHASE_mvt"].eq("DEP")
-    for c in ["BLOCK_TIME_UTC_mvt", "TAXITIME_SEC_mvt", "AOBT_3_flt", "LOBT_flt"]:
+    for c in ["BLOCK_TIME_UTC_mvt", "TAXITIME_SEC_mvt"]:
         rank[c] = rank[c].where(~dep)
     rank.to_parquet(data / "ranking.parquet")
     sub = rank.loc[dep, [ID, TARGET]].sample(frac=1, random_state=0)
@@ -608,14 +644,14 @@ def main():
 
     s = sub.add_parser("validate")
     s.add_argument("--max-target", type=float, default=3600,
-                   help="drop training rows with taxi-out above this many seconds")
+                   help="normal-taxi regressor ignores taxi-out above this many seconds")
     s.add_argument("--fast", action="store_true")
     s.add_argument("--use-actual-obt", action="store_true")
     s.set_defaults(func=cmd_validate)
 
     s = sub.add_parser("submit")
     s.add_argument("--max-target", type=float, default=3600,
-                   help="drop training rows with taxi-out above this many seconds")
+                   help="normal-taxi regressor ignores taxi-out above this many seconds")
     s.add_argument("--name", required=True)
     s.add_argument("--version", type=int, default=1)
     s.add_argument("--rounds", type=int)
