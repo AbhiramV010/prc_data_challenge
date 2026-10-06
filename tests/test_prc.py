@@ -121,6 +121,7 @@ def tiny_departures():
         "FLIGHT_RULE_mvt": s(["I"] * n), "FLIGHT_RULE_flt": s(["I"] * n),
         "WK_TBL_CAT_flt": s(["M"] * n), "MARKET_SEGMENT_flt": s(["Mainline"] * n),
         "AIRCRAFT_OPERATOR_flt": s(["OP1"] * n), "FLIGHT_TYPE_flt": s(["S"] * n),
+        "FLIGHT_mvt": s(["RYR1234", "KL1521", None]),
         "hour": [0.0] * n, "dow": [0] * n, "unmatched": [0.0, 1.0, 0.0],
         "t": [600.0, 700.0, 1000.0], "obt": [0.0, 100.0, 650.0],
         "SCHED_TIME_UTC_mvt": [0.0] * n, "EOBT_1_flt": [0.0] * n, "IOBT_flt": [0.0] * n,
@@ -143,6 +144,9 @@ class TestBuildFeatures(unittest.TestCase):
         self.assertEqual(self.X["actype"].tolist(), ["A21N", "A320", "B738"])
         self.assertEqual(self.X["apt_rwy"].iloc[0], "A|R")
         self.assertEqual(self.X["apt_stand"].iloc[1], "A|S2")
+        self.assertEqual(self.X["operator"].tolist(), ["OP1"] * 3)
+        self.assertEqual(self.X["airline"].tolist()[:2], ["RYR", "KL"])
+        self.assertTrue(pd.isna(self.X["airline"].iloc[2]))
 
     def test_queue_features_for_middle_departure(self):
         r = self.X.iloc[1]  # pushback 100, takeoff 700
@@ -187,18 +191,63 @@ class TestModelHelpers(unittest.TestCase):
 
     def test_predict_mix(self):
         class Fixed:
+            def __init__(self, values=(), raw=()):
+                self.values, self.raw = np.array(values, dtype=float), np.array(raw, dtype=float)
+
+            def predict(self, X, raw_score=False):
+                return self.raw if raw_score else self.values
+
+        X = pd.DataFrame({"mvt_minus_sched": [1000.0, 5000.0, np.nan, -100.0]})
+        reg = Fixed([800.0, 800.0, 700.0, -50.0])
+        pred, p, normal = prc.predict_mix({"stale": Fixed([0.0, 1.0, 0.5, 1.0]), "reg": reg}, X)
+        # Stale rows take takeoff - scheduled; no schedule falls back to the normal model.
+        np.testing.assert_allclose(pred, [800.0, 5000.0, 700.0, 0.0])
+        np.testing.assert_array_equal(normal, [800.0, 800.0, 700.0, 0.0])
+
+        # With the blend booster, P(stale) is the sigmoid of the stale and mix logits summed.
+        models = {"stale": Fixed(raw=[0.0] * 4), "mix": Fixed(raw=[0.0, np.log(3), 0.0, 0.0]), "reg": reg}
+        pred, p, _ = prc.predict_mix(models, X)
+        np.testing.assert_allclose(p, [0.5, 0.75, 0.5, 0.5])
+        np.testing.assert_allclose(pred, [900.0, 3950.0, 700.0, 0.0])
+
+    def test_predict_mix_late_unmatched_uses_airport_rates(self):
+        class Fixed:
             def __init__(self, values):
                 self.values = np.array(values, dtype=float)
 
-            def predict(self, X):
+            def predict(self, X, raw_score=False):
                 return self.values
 
-        X = pd.DataFrame({"mvt_minus_sched": [1000.0, 5000.0, np.nan, -100.0]})
-        models = {"stale": Fixed([0.0, 1.0, 0.5, 1.0]), "reg": Fixed([800.0, 800.0, 700.0, -50.0])}
-        pred, _, normal = prc.predict_mix(models, X)
-        # Stale rows take takeoff - scheduled; no schedule falls back to the normal model.
-        np.testing.assert_array_equal(pred, [800.0, 5000.0, 700.0, 0.0])
-        np.testing.assert_array_equal(normal, [800.0, 800.0, 700.0, 0.0])
+        late = prc.LATE_UNMATCHED_SEC + 1000.0
+        X = pd.DataFrame({"mvt_minus_sched": [late, late, late, 5000.0],
+                          "airport": ["LIRF", "EDDF", "LEMD", "LIRF"],
+                          "unmatched": [1.0, 1.0, 1.0, 1.0]})
+        models = {"stale": Fixed([0.0, 0.9, 0.9, 0.0]), "reg": Fixed([1000.0, 900.0, 800.0, 700.0]),
+                  "late_rates": {"LIRF": (0.5, 0.25), "EDDF": (0.0, 0.0)}}
+        pred, _, _ = prc.predict_mix(models, X)
+        lirf = 0.5 * late + 0.25 * (prc.DAY_SEC + 1000.0) + 0.25 * 1000.0
+        # LIRF and EDDF use their rates; LEMD has none so keeps the classifier; row 4 is not late.
+        np.testing.assert_allclose(pred, [lirf, 900.0, 0.9 * late + 0.1 * 800.0, 700.0])
+
+    def test_late_unmatched_rates(self):
+        late = prc.LATE_UNMATCHED_SEC + 1.0
+        X = pd.DataFrame({"mvt_minus_sched": [late, late, late, late, 100.0, late],
+                          "airport": ["LIRF", "LIRF", "LIRF", "LIRF", "LIRF", "EDDF"],
+                          "unmatched": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]})
+        y = pd.Series([late, late, prc.DAY_SEC + 900.0, 1200.0, 50000.0, 800.0])
+        stale = pd.Series([1.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+        rates = prc.late_unmatched_rates(X, y, stale, np.ones(6, dtype=bool))
+        # Row 5 is not late, so LIRF has 4 rows: 2 stale, 1 a day early, 1 normal.
+        self.assertEqual(rates, {"LIRF": (0.5, 0.25), "EDDF": (0.0, 0.0)})
+        # Matched flights and rows outside the mask are ignored.
+        X["unmatched"] = [0.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        mask = np.array([True, True, True, True, True, False])
+        self.assertEqual(prc.late_unmatched_rates(X, y, stale, mask), {"LIRF": (1 / 3, 1 / 3)})
+
+    def test_blend_parts(self):
+        n, m = prc.blend_parts(np.array([-5.0, 100.0, 200.0]), np.array([np.nan, -30.0, 500.0]))
+        np.testing.assert_array_equal(n, [0.0, 100.0, 200.0])
+        np.testing.assert_array_equal(m, [0.0, 0.0, 500.0])  # no schedule -> normal; clipped at 0
 
     def test_rmse(self):
         self.assertAlmostEqual(prc.rmse([0, 0], [3, 4]), np.sqrt(12.5))
@@ -228,22 +277,29 @@ def report_rmse(label, stdout):
     """Keep validate's RMSE lines for the summary and results.csv written after all tests."""
     RMSE_REPORT.append(label)
     RMSE_REPORT.extend("  " + line for line in stdout.splitlines() if line.startswith("RMSE"))
-    clean = re.search(r"RMSE clean \(.*?([\d,]+) rows\): model ([\d.]+)\s+\|\s+airport-mean "
-                      r"baseline ([\d.]+)", stdout)
-    every = re.search(r"RMSE all rows: model ([\d.]+)\s+\|\s+baseline ([\d.]+)\s+\|\s+best_iter (\d+)",
+    clean = re.search(r"RMSE clean \(.*?([\d,]+) rows\): model ([\d.]+)\s.*?airport-mean baseline ([\d.]+)",
                       stdout)
-    if clean and every:
-        RMSE_RESULTS.append({
-            "dataset": label, "rows_clean": int(clean.group(1).replace(",", "")),
-            "model_rmse_clean": float(clean.group(2)), "baseline_rmse_clean": float(clean.group(3)),
-            "model_rmse_all": float(every.group(1)), "baseline_rmse_all": float(every.group(2)),
-            "best_iter": int(every.group(3)),
-        })
+    every = re.search(r"RMSE all rows \([\d,]+\): model ([\d.]+)\s.*?airport-mean baseline ([\d.]+)", stdout)
+    best = re.search(r"best_iter\.json: \{'reg': (\d+)", stdout)  # normal-taxi regressor's best round
+    assert clean and every and best, f"validate output format changed:\n{stdout}"
+    RMSE_RESULTS.append({
+        "dataset": label, "rows_clean": int(clean.group(1).replace(",", "")),
+        "model_rmse_clean": float(clean.group(2)), "baseline_rmse_clean": float(clean.group(3)),
+        "model_rmse_all": float(every.group(1)), "baseline_rmse_all": float(every.group(2)),
+        "best_iter": int(best.group(1)),
+    })
+
+
+def rmse_summary():
+    """Final RMSE values from every validate run, printed after all tests (see conftest.py)."""
+    if not RMSE_REPORT:
+        return ""
+    return "\n".join(["++==++==", "Final RMSE (seconds)", *RMSE_REPORT, "++==++=="])
 
 
 def tearDownModule():
-    if RMSE_REPORT:
-        print("\n\nRMSE summary\n" + "\n".join(RMSE_REPORT), file=sys.stderr)
+    if "pytest" not in sys.modules:  # under pytest, conftest.py prints it so capturing can't hide it
+        print("\n" + rmse_summary(), file=sys.stderr)
     if RMSE_RESULTS:
         run_at = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
         new = not RESULTS_CSV.exists() or RESULTS_CSV.stat().st_size == 0
@@ -275,7 +331,7 @@ class TestEndToEnd(unittest.TestCase):
         self.assertIn("RMSE clean", r.stdout)
         report_rmse("Synthetic test data (fake; only shows the pipeline works)", r.stdout)
         best = json.loads((self.root / "artifacts" / "best_iter.json").read_text())
-        self.assertEqual(set(best), {"reg", "stale"})
+        self.assertEqual(set(best), {"reg", "stale", "mix"})
 
         r = run_cli("submit", "--name", "team", "--fast", "--use-actual-obt", root=self.root)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -383,7 +439,12 @@ class TestCompetitionData(unittest.TestCase):
         assert m, r.stdout
         model, baseline = float(m.group(1)), float(m.group(2))
         self.assertLess(model, baseline)
-        self.assertLess(model, 260)  # fast run scored 227.8; guards against regressions
+        self.assertLess(model, 260)  # fast run scored 244.8; guards against regressions
+
+        # All rows is what the leaderboard scores; fast run scored 345.4.
+        m = re.search(r"RMSE all rows .*model ([\d.]+) .*baseline ([\d.]+)", r.stdout)
+        assert m, r.stdout
+        self.assertLess(float(m.group(1)), 380)
 
 
 if __name__ == "__main__":

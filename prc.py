@@ -23,13 +23,18 @@ STR_COLS = [
     "PHASE_mvt", "ADEP_mvt", "ADES_mvt", "ADEP_flt", "ADES_flt", "RUNWAY_mvt", "STAND_mvt",
     "AIRCRAFT_TYPE_mvt", "AIRCRAFT_TYPE_flt", "FLIGHT_RULE_mvt", "FLIGHT_RULE_flt",
     "WK_TBL_CAT_flt", "MARKET_SEGMENT_flt", "AIRCRAFT_OPERATOR_flt", "FLIGHT_TYPE_flt",
+    "FLIGHT_mvt",
 ]
 CAT_FEATS = ["airport", "apt_rwy", "apt_stand", "actype", "dest", "rule", "wake",
-             "market", "operator", "ftype"]
+             "market", "operator", "airline", "ftype"]
 MIN_CAT_COUNT = 30
 # |off-block - scheduled| at or below this means the airport logged the schedule as off-block,
 # so the target is simply takeoff minus scheduled time.
 STALE_SEC = 60
+# Unmatched flights this long after their schedule are mostly logged with the schedule as off-block
+# (stale) or a day early, so the target is huge; neither shows up in the normal-taxi model.
+LATE_UNMATCHED_SEC = 21600
+DAY_SEC = 86400
 
 # (name, lo offset s, lo side, hi offset s, hi side); searchsorted sides set open/closed bounds
 DEP_WINDOWS = [("dep_prev10", -600, "left", 0, "left"),
@@ -297,6 +302,7 @@ def build_features(dep, events, use_obt=False):
     X["wake"] = dep["WK_TBL_CAT_flt"]
     X["market"] = dep["MARKET_SEGMENT_flt"]
     X["operator"] = dep["AIRCRAFT_OPERATOR_flt"]
+    X["airline"] = dep["FLIGHT_mvt"].str.extract(r"^([A-Za-z]+)", expand=False).str.upper()
     X["ftype"] = dep["FLIGHT_TYPE_flt"]
 
     X["hour"], X["dow"] = dep["hour"], dep["dow"]
@@ -382,13 +388,61 @@ def fit_masks(dep, mask, fast, max_target):
     return reg.to_numpy(), labelled.to_numpy()
 
 
+def sigmoid(z):
+    return 1 / (1 + np.exp(-z))
+
+
+def blend_parts(normal, ms, cap=None):
+    """Clipped normal-taxi prediction and the stale alternative (normal when there is no schedule).
+    cap bounds the stale alternative, so one huge takeoff - scheduled gap cannot drag a row far."""
+    n = np.clip(normal, 0, None)
+    return n, np.where(np.isnan(ms), n, np.clip(np.nan_to_num(ms), 0, cap))
+
+
+def mix_rows(X, y, mask, tail, max_target):
+    """Rows the blend booster fits and stops on. With tail rules, late unmatched rows are priced by
+    their airport rates instead; without, targets past max_target are out of reach of a capped blend."""
+    if tail:
+        return mask & ~late_unmatched(X)
+    yv = np.asarray(y, float)
+    return mask & (yv > 0) & (yv <= max_target)
+
+
+def late_unmatched(X):
+    return (X["unmatched"].to_numpy(float) == 1) & (X["mvt_minus_sched"].to_numpy(float) > LATE_UNMATCHED_SEC)
+
+
+def late_unmatched_rates(X, y, stale, mask):
+    """Per airport, among late unmatched rows: (share logged stale, share a day early)."""
+    rows = np.asarray(mask) & late_unmatched(X)
+    apt = X["airport"].astype(object).to_numpy()
+    yv, st = np.asarray(y, float), np.asarray(stale, float) == 1
+    rates = {}
+    for a in sorted(set(apt[rows])):
+        r = rows & (apt == a)
+        rates[a] = (float(st[r].mean()), float((~st[r] & (yv[r] > DAY_SEC / 2)).mean()))
+    return rates
+
+
 def predict_mix(models, X):
     """Expected taxi-out: P(stale) * (takeoff - scheduled) + (1 - P(stale)) * normal taxi."""
-    p = np.asarray(models["stale"].predict(X), dtype=float)
-    normal = np.asarray(models["reg"].predict(X), dtype=float)
-    ms = X["mvt_minus_sched"].to_numpy(float)
-    mix = np.where(np.isnan(ms), normal, p * np.clip(np.nan_to_num(ms), 0, None) + (1 - p) * normal)
-    return np.clip(mix, 0, None), p, np.clip(normal, 0, None)
+    if "mix" in models:
+        z = models["stale"].predict(X, raw_score=True) + models["mix"].predict(X, raw_score=True)
+        p = sigmoid(np.asarray(z, dtype=float))
+    else:
+        p = np.asarray(models["stale"].predict(X), dtype=float)
+    n, m = blend_parts(np.asarray(models["reg"].predict(X), dtype=float),
+                       X["mvt_minus_sched"].to_numpy(float), models.get("cap"))
+    pred = p * m + (1 - p) * n
+    rates = models.get("late_rates")
+    if rates:
+        # Late unmatched rows use their airport's observed rates instead of the classifier.
+        apt = X["airport"].astype(object).to_numpy()
+        for i in np.flatnonzero(late_unmatched(X)):
+            if apt[i] in rates:
+                stl, day = rates[apt[i]]
+                pred[i] = stl * m[i] + day * (DAY_SEC + n[i]) + (1 - stl - day) * n[i]
+    return np.clip(pred, 0, None), p, n
 
 
 def fit_both(X, y, stale, reg_m, stale_m, rounds, fast, reg_v=None, stale_v=None):
@@ -398,6 +452,58 @@ def fit_both(X, y, stale, reg_m, stale_m, rounds, fast, reg_v=None, stale_v=None
     stl = fit(X.loc[stale_m], stale.loc[stale_m], rounds["stale"], fast,
               X.loc[stale_v] if ev else None, stale.loc[stale_v] if ev else None, "binary")
     return {"reg": reg, "stale": stl}
+
+
+def oof_parts(X, y, stale, reg_m, stale_m, month, rounds, fast):
+    """Normal-taxi predictions and stale logits for the classifier rows, each from models trained
+    on the other month parity, so the mix booster learns from errors like those on unseen months."""
+    n, z = np.full(len(X), np.nan), np.full(len(X), np.nan)
+    odd = (month % 2 == 1).to_numpy()
+    for fold in (odd, ~odd):
+        m = fit_both(X, y, stale, reg_m & ~fold, stale_m & ~fold, rounds, fast)
+        rows = stale_m & fold
+        n[rows] = m["reg"].predict(X.loc[rows])
+        z[rows] = m["stale"].predict(X.loc[rows], raw_score=True)
+    return n, z
+
+
+MIX_SCALE = 1e4  # keeps gradients of squared seconds in a range LightGBM handles well
+MIX_MIN_HESS = 1e-3
+
+
+def fit_mix(X, y, ms, n, z, rounds, fast, valid=None, cap=None):
+    """Boosts the stale logit so the blend itself, not the stale label, has the lowest squared error.
+    RMSE is driven by rows where takeoff - scheduled is far from a normal taxi, and only this loss
+    knows that misjudging those rows costs far more than misjudging the rest.
+    valid is (Xv, yv, msv, nv, zv) for early stopping."""
+    import lightgbm as lgb
+
+    class BlendDataset(lgb.Dataset):
+        parts: tuple[np.ndarray, np.ndarray]
+
+    def objective(score, ds):
+        nn, mm = ds.parts
+        p = sigmoid(score)
+        d = (mm - nn) * p * (1 - p)
+        r = nn + p * (mm - nn) - ds.get_label()
+        return 2 * r * d / MIX_SCALE, np.maximum(2 * d * d, MIX_MIN_HESS) / MIX_SCALE
+
+    def blend_rmse(score, ds):
+        nn, mm = ds.parts
+        p = sigmoid(score)
+        return "blend_rmse", rmse(nn + p * (mm - nn), ds.get_label()), False
+
+    dtr = BlendDataset(X, y, init_score=z, categorical_feature=CAT_FEATS, free_raw_data=True)
+    dtr.parts = blend_parts(n, ms, cap)
+    params = dict(lgb_params(fast), objective=objective, metric="None", learning_rate=0.02,
+                  num_leaves=31, min_data_in_leaf=500, min_sum_hessian_in_leaf=0)
+    if valid is None:
+        return lgb.train(params, dtr, rounds)
+    Xv, yv, msv, nv, zv = valid
+    dv = BlendDataset(Xv, yv, init_score=zv, reference=dtr)
+    dv.parts = blend_parts(nv, msv, cap)
+    return lgb.train(params, dtr, rounds, valid_sets=[dv], valid_names=["valid"], feval=blend_rmse,
+                     callbacks=[lgb.early_stopping(200), lgb.log_evaluation(100)])
 
 
 def rmse(a, b):
@@ -423,17 +529,38 @@ def cmd_validate(args):
     rounds = 1500 if args.fast else 5000
     models = fit_both(X, y, stale, reg_m, stale_m, {"reg": rounds, "stale": rounds}, args.fast,
                       reg_v, stale_v)
-    pred, p, normal = predict_mix(models, X.loc[vm])
+    best = {k: m.best_iteration for k, m in models.items()}
+    if args.tail:
+        rates_m = (is_train & ~hold & dep["stale"].notna() & dep[TARGET].notna()).to_numpy()
+        models["late_rates"] = late_unmatched_rates(X, y, stale, rates_m)
+        print("Late unmatched (> %ds) rates (stale, day early): %s" % (LATE_UNMATCHED_SEC, ", ".join(
+            f"{a} ({s:.2f}, {d:.2f})" for a, (s, d) in models["late_rates"].items())))
+    else:
+        models["cap"] = args.max_target
+    classifier_only, _, _ = predict_mix(models, X.loc[vm])
+    print("\nOut-of-fold predictions for the blend booster")
+    n_oof, z_oof = oof_parts(X, y, stale, reg_m, stale_m, dep["month"], best, args.fast)
+    mix_m, vl = (mix_rows(X, y, m, args.tail, args.max_target) for m in (stale_m, vm))
+    Xl = X.loc[vl]
+    valid = (Xl, y.loc[vl], Xl["mvt_minus_sched"].to_numpy(float), models["reg"].predict(Xl),
+             models["stale"].predict(Xl, raw_score=True))
+    print("Blend booster")
+    models["mix"] = fit_mix(X.loc[mix_m], y.loc[mix_m], X.loc[mix_m, "mvt_minus_sched"].to_numpy(float),
+                            n_oof[mix_m], z_oof[mix_m], 3000, args.fast, valid, models.get("cap"))
+    Xv = X.loc[vm]
+    pred, p, normal = predict_mix(models, Xv)
     yv = y.loc[vm].to_numpy(float)
     c = (yv > 0) & (yv <= args.max_target)
 
     fit_y = y.loc[stale_m]
     apt_mean = fit_y.groupby(dep.loc[stale_m, "airport"]).mean()
     base = dep.loc[vm, "airport"].map(apt_mean).fillna(fit_y.mean()).to_numpy(float)
-    print(f"\nRMSE all rows ({vm.sum():,}): model {rmse(pred, yv):.2f}  |  normal-taxi model only "
-          f"{rmse(normal, yv):.2f}  |  airport-mean baseline {rmse(base, yv):.2f}")
+    print(f"\nRMSE all rows ({vm.sum():,}): model {rmse(pred, yv):.2f}  |  classifier blend "
+          f"{rmse(classifier_only, yv):.2f}  |  normal-taxi model only {rmse(normal, yv):.2f}  |  "
+          f"airport-mean baseline {rmse(base, yv):.2f}")
     print(f"RMSE clean (0 < y <= {args.max_target:.0f}s, {c.sum():,} rows): "
-          f"model {rmse(pred[c], yv[c]):.2f}  |  airport-mean baseline {rmse(base[c], yv[c]):.2f}")
+          f"model {rmse(pred[c], yv[c]):.2f}  |  classifier blend {rmse(classifier_only[c], yv[c]):.2f}  |  "
+          f"airport-mean baseline {rmse(base[c], yv[c]):.2f}")
     sv = stale.loc[vm].to_numpy(float)
     print(f"Stale-block share {np.nanmean(sv):.3f}; mean P(stale) when stale {p[sv == 1].mean():.3f}, "
           f"when not {p[sv == 0].mean():.3f}")
@@ -454,7 +581,12 @@ def cmd_validate(args):
         print((imp / imp.sum()).sort_values(ascending=False).head(k).round(4).to_string())
 
     art.mkdir(parents=True, exist_ok=True)
-    best = {k: m.best_iteration for k, m in models.items()}
+    pd.DataFrame({ID: dep.loc[vm, ID].to_numpy(), "airport": dep.loc[vm, "airport"].to_numpy(),
+                  "y": yv, "pred": pred, "classifier": classifier_only, "p_stale": p, "normal": normal,
+                  "stale": sv, "mvt_minus_sched": Xv["mvt_minus_sched"].to_numpy(float),
+                  "unmatched": Xv["unmatched"].to_numpy(float)}).to_parquet(art / "val_predictions.parquet",
+                                                                          index=False)
+    best["mix"] = models["mix"].best_iteration
     (art / "best_iter.json").write_text(json.dumps(best))
     print(f"\nSaved {art / 'best_iter.json'}: {best}")
 
@@ -468,17 +600,27 @@ def cmd_submit(args):
     X = encode_cats(X, stale_m)
 
     best = art / "best_iter.json"
+    rounds = {"reg": 600 if args.fast else 2000, "stale": 300 if args.fast else 1000, "mix": 100}
     if args.rounds:
-        rounds = {"reg": args.rounds, "stale": args.rounds}
+        rounds.update(reg=args.rounds, stale=args.rounds)
     elif best.exists():
         # More training rows than in validation, so train ~10% longer.
-        rounds = {k: max(int(v * 1.1), 50) for k, v in json.loads(best.read_text()).items()}
-    else:
-        rounds = {"reg": 600 if args.fast else 2000, "stale": 300 if args.fast else 1000}
+        rounds.update({k: max(int(v * 1.1), 50) for k, v in json.loads(best.read_text()).items()})
     print(f"regressor rows {reg_m.sum():,}, classifier rows {stale_m.sum():,}, "
           f"ranking departures {rm.sum():,}, rounds {rounds}")
     y = pd.Series(dep[TARGET], dtype=float)
-    models = fit_both(X, y, pd.Series(dep["stale"], dtype=float), reg_m, stale_m, rounds, args.fast)
+    stale = pd.Series(dep["stale"], dtype=float)
+    models = fit_both(X, y, stale, reg_m, stale_m, rounds, args.fast)
+    if args.tail:
+        rates_m = (dep["split"].eq("train") & dep["stale"].notna() & dep[TARGET].notna()).to_numpy()
+        models["late_rates"] = late_unmatched_rates(X, y, stale, rates_m)
+        print("Late unmatched rates (stale, day early):", models["late_rates"])
+    else:
+        models["cap"] = args.max_target
+    n_oof, z_oof = oof_parts(X, y, stale, reg_m, stale_m, dep["month"], rounds, args.fast)
+    mix_m = mix_rows(X, y, stale_m, args.tail, args.max_target)
+    models["mix"] = fit_mix(X.loc[mix_m], y.loc[mix_m], X.loc[mix_m, "mvt_minus_sched"].to_numpy(float),
+                            n_oof[mix_m], z_oof[mix_m], rounds["mix"], args.fast, cap=models.get("cap"))
     pred = pd.Series(predict_mix(models, X.loc[rm])[0], index=dep.loc[rm, ID].astype(str).to_numpy())
 
     tid = template[ID].astype(str)
@@ -647,6 +789,9 @@ def main():
                    help="normal-taxi regressor ignores taxi-out above this many seconds")
     s.add_argument("--fast", action="store_true")
     s.add_argument("--use-actual-obt", action="store_true")
+    s.add_argument("--tail", action="store_true",
+                   help="price huge late-unmatched targets with per-airport rates and leave the stale "
+                        "term uncapped; only pays off if the scored months contain such rows")
     s.set_defaults(func=cmd_validate)
 
     s = sub.add_parser("submit")
@@ -657,6 +802,9 @@ def main():
     s.add_argument("--rounds", type=int)
     s.add_argument("--fast", action="store_true")
     s.add_argument("--use-actual-obt", action="store_true")
+    s.add_argument("--tail", action="store_true",
+                   help="price huge late-unmatched targets with per-airport rates and leave the stale "
+                        "term uncapped; only pays off if the scored months contain such rows")
     s.set_defaults(func=cmd_submit)
 
     s = sub.add_parser("synth", help="write small synthetic data for testing")
