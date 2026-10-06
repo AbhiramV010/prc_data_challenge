@@ -275,7 +275,7 @@ class TestEndToEnd(unittest.TestCase):
         self.assertIn("RMSE clean", r.stdout)
         report_rmse("Synthetic test data (fake; only shows the pipeline works)", r.stdout)
         best = json.loads((self.root / "artifacts" / "best_iter.json").read_text())
-        self.assertEqual(set(best), {"reg", "stale"})
+        self.assertEqual(set(best), {"reg", "stale", "mix"})
 
         r = run_cli("submit", "--name", "team", "--fast", "--use-actual-obt", root=self.root)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -383,7 +383,12 @@ class TestCompetitionData(unittest.TestCase):
         assert m, r.stdout
         model, baseline = float(m.group(1)), float(m.group(2))
         self.assertLess(model, baseline)
-        self.assertLess(model, 260)  # fast run scored 227.8; guards against regressions
+        # The competition scores all rows; the blend booster trades a little clean-row RMSE for
+        # much lower all-row RMSE (fast run: 383.1 vs 415.3 for the classifier-only blend).
+        m = re.search(r"RMSE all rows .*model ([\d.]+) .*classifier blend ([\d.]+)", r.stdout)
+        assert m, r.stdout
+        self.assertLess(float(m.group(1)), float(m.group(2)))
+        self.assertLess(float(m.group(1)), 400)  # guards against regressions
 
 
 if __name__ == "__main__":
