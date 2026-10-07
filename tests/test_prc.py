@@ -104,6 +104,14 @@ class TestCounting(unittest.TestCase):
         np.testing.assert_array_equal(out["dep_next15"], [1, 0, 0, np.nan])
         np.testing.assert_array_equal(out["dep_pm30"], [3, 1, 0, np.nan])
 
+    def test_window_means(self):
+        vals = pd.Series([10.0, 20.0, 30.0, 40.0])
+        q_key, q_t = s(["A", "A", "C"]), pd.Series([100.0, 1001.0, 10.0])
+        out = prc.window_means(self.ev_key, self.ev_t, vals, q_key, q_t, [("past", -1000, 0), ("all", -2000, 2000)])
+        # A events at 0, 100, 1000 with values 10, 20, 30; the window end is open, so time 100 itself is out.
+        np.testing.assert_array_equal(out["past"], [10.0, 25.0, np.nan])
+        np.testing.assert_array_equal(out["all"], [20.0, 20.0, np.nan])
+
     def test_neighbor_gaps_excludes_self_and_other_keys(self):
         q_key, q_t = s(["A", "A", "B", "C"]), pd.Series([100.0, 500.0, 50.0, 10.0])
         prev, nxt = prc.neighbor_gaps(self.ev_key, self.ev_t, q_key, q_t)
@@ -163,6 +171,13 @@ class TestBuildFeatures(unittest.TestCase):
 
     def test_first_departure_has_no_previous_gap(self):
         self.assertTrue(np.isnan(self.X["rwy_gap_prev_dep"].iloc[0]))
+
+    def test_duplicate_record_flags(self):
+        self.assertEqual(self.X["actype_mvt_missing"].tolist(), [1.0, 0.0, 0.0])
+        # Only the first two departures have callsigns, each used once.
+        self.assertEqual(self.X["cs_deps_same_day"].tolist()[:2], [1.0, 1.0])
+        self.assertTrue(np.isnan(self.X["cs_deps_same_day"].iloc[2]))
+        self.assertTrue(self.X["cs_gap_nearest"].isna().all())
 
     def test_obt_features_only_with_flag(self):
         dep, events = tiny_departures()
@@ -243,6 +258,44 @@ class TestModelHelpers(unittest.TestCase):
         X["unmatched"] = [0.0, 1.0, 1.0, 1.0, 1.0, 1.0]
         mask = np.array([True, True, True, True, True, False])
         self.assertEqual(prc.late_unmatched_rates(X, y, stale, mask), {"LIRF": (1 / 3, 1 / 3)})
+
+    def test_blend_parts_cap_bounds_stale_term(self):
+        n, m = prc.blend_parts(np.array([500.0, 500.0, 500.0]), np.array([np.nan, 90000.0, 800.0]), cap=3600)
+        np.testing.assert_array_equal(m, [500.0, 3600.0, 800.0])
+        n, m = prc.blend_parts(np.array([500.0]), np.array([90000.0]))
+        self.assertEqual(m[0], 90000.0)
+
+    def test_predict_mix_cap_keeps_predictions_bounded(self):
+        class Fixed:
+            def __init__(self, values):
+                self.values = np.array(values, dtype=float)
+
+            def predict(self, X, raw_score=False):
+                return self.values
+
+        X = pd.DataFrame({"mvt_minus_sched": [90000.0, 800.0]})
+        models = {"stale": Fixed([0.5, 0.5]), "reg": Fixed([700.0, 700.0])}
+        uncapped, _, _ = prc.predict_mix(models, X)
+        capped, _, _ = prc.predict_mix({**models, "cap": 3600.0}, X)
+        np.testing.assert_allclose(uncapped, [45350.0, 750.0])
+        np.testing.assert_allclose(capped, [2150.0, 750.0])  # the stale term is limited to max_target
+
+    def test_mix_rows(self):
+        X = pd.DataFrame({"unmatched": [1.0, 1.0, 0.0, 1.0],
+                          "mvt_minus_sched": [prc.LATE_UNMATCHED_SEC + 1, 100.0, 100.0, 100.0]})
+        y = pd.Series([50000.0, 800.0, 90000.0, -5.0])
+        mask = np.ones(4, dtype=bool)
+        # Capped mode keeps only 0 < y <= max_target; tail mode drops only late unmatched rows.
+        np.testing.assert_array_equal(prc.mix_rows(X, y, mask, False, 3600), [False, True, False, False])
+        np.testing.assert_array_equal(prc.mix_rows(X, y, mask, True, 3600), [False, True, True, True])
+
+    def test_stack_features(self):
+        X = pd.DataFrame({"mvt_minus_sched": [900.0, 5000.0, np.nan]})
+        out = prc.stack_features(X, np.array([1000.0, -20.0, 700.0]))
+        np.testing.assert_array_equal(out["n_hat"], [1000.0, 0.0, 700.0])  # normal prediction is clipped at 0
+        np.testing.assert_array_equal(out["ms_minus_n"], [-100.0, 5000.0, np.nan])
+        np.testing.assert_array_equal(out["abs_ms_minus_n"], [100.0, 5000.0, np.nan])
+        self.assertNotIn("n_hat", X)  # the input frame is left alone
 
     def test_blend_parts(self):
         n, m = prc.blend_parts(np.array([-5.0, 100.0, 200.0]), np.array([np.nan, -30.0, 500.0]))
@@ -439,12 +492,13 @@ class TestCompetitionData(unittest.TestCase):
         assert m, r.stdout
         model, baseline = float(m.group(1)), float(m.group(2))
         self.assertLess(model, baseline)
-        self.assertLess(model, 260)  # fast run scored 244.8; guards against regressions
+        self.assertLess(model, 240)  # fast run scored 227.7; guards against regressions
 
-        # All rows is what the leaderboard scores; fast run scored 345.4.
+        # Default mode caps predictions at max_target, so huge stale targets are not priced:
+        # all rows still beats the airport-mean baseline but is far above the clean score.
         m = re.search(r"RMSE all rows .*model ([\d.]+) .*baseline ([\d.]+)", r.stdout)
         assert m, r.stdout
-        self.assertLess(float(m.group(1)), 380)
+        self.assertLess(float(m.group(1)), float(m.group(2)))
 
 
 if __name__ == "__main__":

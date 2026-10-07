@@ -4,3 +4,7 @@ run_at,dataset,rows_clean,model_rmse_clean,baseline_rmse_clean,model_rmse_all,ba
 2026-10-05 21:51:51,Synthetic test data (fake; only shows the pipeline works),1536,16.59,122.13,16.59,122.13,50
 2026-10-05 21:51:51,"Competition data (fast run, 30% of training rows)",343355,263.5,375.94,383.13,659.96,145
 2026-10-06 08:49:00,Synthetic test data (fake; only shows the pipeline works),1536,16.59,122.13,16.59,122.13,50
+2026-10-06 16:55:03,Synthetic test data (fake; only shows the pipeline works),1536,17.7,122.13,17.7,122.13,50
+2026-10-06 16:55:03,"Competition data (fast run, 30% of training rows)",343355,226.25,375.94,565.75,659.96,262
+2026-10-06 18:11:27,Synthetic test data (fake; only shows the pipeline works),1536,17.82,122.13,17.82,122.13,50
+2026-10-06 19:23:26,Synthetic test data (fake; only shows the pipeline works),1536,16.92,122.13,16.92,122.13,49

@@ -291,6 +291,33 @@ def window_counts(ev_key: pd.Series, ev_t: pd.Series, q_key: pd.Series, q_t: pd.
     return out
 
 
+def window_means(ev_key: pd.Series, ev_t: pd.Series, ev_val, q_key: pd.Series, q_t: pd.Series,
+                 windows) -> dict[str, np.ndarray]:
+    """Mean of ev_val over events with the same key and time in [q_t + lo, q_t + hi), per (name, lo, hi)."""
+    ev_key, ev_t = ev_key.reset_index(drop=True), ev_t.reset_index(drop=True)
+    codes, _ = pd.factorize(pd.concat([ev_key, q_key.reset_index(drop=True)], ignore_index=True))
+    n = len(ev_key)
+    ec, qc = codes[:n].astype(np.int64), codes[n:].astype(np.int64)
+    et, val, qt = ev_t.to_numpy(float), np.asarray(ev_val, float), q_t.to_numpy(float)
+    ok = (ec >= 0) & ~np.isnan(et) & ~np.isnan(val)
+    code = ec[ok] * SPAN + et[ok].astype(np.int64)
+    order = np.argsort(code, kind="stable")
+    ev, cs = code[order], np.concatenate([[0.0], np.cumsum(val[ok][order])])
+    ok_q = (qc >= 0) & ~np.isnan(qt)
+    qv = qc[ok_q] * SPAN + qt[ok_q].astype(np.int64)
+    out = {}
+    for name, lo, hi in windows:
+        a, b = np.searchsorted(ev, qv + lo, "left"), np.searchsorted(ev, qv + hi, "left")
+        col = np.full(len(qt), np.nan)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            col[ok_q] = np.where(b > a, (cs[b] - cs[a]) / (b - a), np.nan)
+        out[name] = col
+    return out
+
+
+STATE_WINDOWS = [("m60", -3600, 0), ("m180", -10800, 0), ("pm60", -3600, 3600)]
+
+
 def build_features(dep, events, use_obt=False):
     X = pd.DataFrame(index=dep.index)
     X["airport"] = dep["airport"]
@@ -340,6 +367,24 @@ def build_features(dep, events, use_obt=False):
         X[f"deps_taxiing_at_{name}"] = count_le(dk, d_obt, apt, q) - count_le(dk, dt, apt, q)
         X[f"arrs_taxiing_at_{name}"] = count_le(ak, at, apt, q) - count_le(ak, a_in, apt, q)
     X["pushbacks_prev15"] = count_le(dk, d_obt, apt, obt) - count_le(dk, d_obt, apt, obt - 900)
+
+    # Airport state around takeoff: slow arrival taxi-in and long pushback-to-takeoff for other
+    # departures mark de-icing, slot holds and storms, when long taxi-outs cluster.
+    taxi_in = (events["inblk"] - events["t"]).clip(0, 7200)[~is_d]
+    push_to = (events["t"] - events["obt"]).clip(0, 7200)[is_d]
+    for prefix, ek, et, val in [("arr_taxiin", ak, at, taxi_in), ("dep_push_to", dk, dt, push_to)]:
+        for name, col in window_means(ek, et, val, apt, t, STATE_WINDOWS).items():
+            X[f"{prefix}_{name}"] = col
+
+    # Duplicate or ghost movement records: the copy with an early block time has a huge target.
+    X["actype_mvt_missing"] = dep["AIRCRAFT_TYPE_mvt"].isna().astype(float)
+    cs = (dep["airport"] + "|" + dep["FLIGHT_mvt"]).where(dep["FLIGHT_mvt"].notna())
+    day = np.floor(t / 86400)
+    g = t.groupby([cs, day])
+    X["cs_deps_same_day"] = g.transform("size").reindex(dep.index)
+    X["cs_rank_same_day"] = g.rank(method="first").reindex(dep.index)
+    prev, nxt = neighbor_gaps(cs, t, cs, t)
+    X["cs_gap_nearest"] = np.fmin(prev, nxt)
     return X
 
 
@@ -363,7 +408,7 @@ def prepare(args):
 def lgb_params(fast, objective="regression"):
     metric = "rmse" if objective == "regression" else "binary_logloss"
     return {"objective": objective, "metric": metric, "learning_rate": 0.1 if fast else 0.05,
-            "num_leaves": 127 if fast else 255, "min_data_in_leaf": 100, "feature_fraction": 0.8,
+            "num_leaves": 127 if fast else 255, "min_data_in_leaf": 100, "feature_fraction": 0.6,
             "bagging_fraction": 0.8, "bagging_freq": 1, "lambda_l2": 1.0, "cat_smooth": 20,
             "cat_l2": 10, "max_cat_threshold": 64, "verbose": -1, "seed": 0}
 
@@ -408,6 +453,14 @@ def mix_rows(X, y, mask, tail, max_target):
     return mask & (yv > 0) & (yv <= max_target)
 
 
+def stack_features(X, normal):
+    """X plus the normal-taxi prediction and how far the schedule gap is from it. A stale row's gap is
+    a normal taxi, a late flight's is not; the blend booster cannot form this difference on its own."""
+    n = np.clip(np.asarray(normal, dtype=float), 0, None)
+    gap = X["mvt_minus_sched"].to_numpy(float) - n
+    return X.assign(n_hat=n, ms_minus_n=gap, abs_ms_minus_n=np.abs(gap))
+
+
 def late_unmatched(X):
     return (X["unmatched"].to_numpy(float) == 1) & (X["mvt_minus_sched"].to_numpy(float) > LATE_UNMATCHED_SEC)
 
@@ -426,13 +479,14 @@ def late_unmatched_rates(X, y, stale, mask):
 
 def predict_mix(models, X):
     """Expected taxi-out: P(stale) * (takeoff - scheduled) + (1 - P(stale)) * normal taxi."""
+    normal = np.asarray(models["reg"].predict(X), dtype=float)
     if "mix" in models:
-        z = models["stale"].predict(X, raw_score=True) + models["mix"].predict(X, raw_score=True)
+        z = (models["stale"].predict(X, raw_score=True)
+             + models["mix"].predict(stack_features(X, normal), raw_score=True))
         p = sigmoid(np.asarray(z, dtype=float))
     else:
         p = np.asarray(models["stale"].predict(X), dtype=float)
-    n, m = blend_parts(np.asarray(models["reg"].predict(X), dtype=float),
-                       X["mvt_minus_sched"].to_numpy(float), models.get("cap"))
+    n, m = blend_parts(normal, X["mvt_minus_sched"].to_numpy(float), models.get("cap"))
     pred = p * m + (1 - p) * n
     rates = models.get("late_rates")
     if rates:
@@ -542,10 +596,12 @@ def cmd_validate(args):
     n_oof, z_oof = oof_parts(X, y, stale, reg_m, stale_m, dep["month"], best, args.fast)
     mix_m, vl = (mix_rows(X, y, m, args.tail, args.max_target) for m in (stale_m, vm))
     Xl = X.loc[vl]
-    valid = (Xl, y.loc[vl], Xl["mvt_minus_sched"].to_numpy(float), models["reg"].predict(Xl),
+    nl = models["reg"].predict(Xl)
+    valid = (stack_features(Xl, nl), y.loc[vl], Xl["mvt_minus_sched"].to_numpy(float), nl,
              models["stale"].predict(Xl, raw_score=True))
     print("Blend booster")
-    models["mix"] = fit_mix(X.loc[mix_m], y.loc[mix_m], X.loc[mix_m, "mvt_minus_sched"].to_numpy(float),
+    models["mix"] = fit_mix(stack_features(X.loc[mix_m], n_oof[mix_m]), y.loc[mix_m],
+                            X.loc[mix_m, "mvt_minus_sched"].to_numpy(float),
                             n_oof[mix_m], z_oof[mix_m], 3000, args.fast, valid, models.get("cap"))
     Xv = X.loc[vm]
     pred, p, normal = predict_mix(models, Xv)
@@ -619,7 +675,8 @@ def cmd_submit(args):
         models["cap"] = args.max_target
     n_oof, z_oof = oof_parts(X, y, stale, reg_m, stale_m, dep["month"], rounds, args.fast)
     mix_m = mix_rows(X, y, stale_m, args.tail, args.max_target)
-    models["mix"] = fit_mix(X.loc[mix_m], y.loc[mix_m], X.loc[mix_m, "mvt_minus_sched"].to_numpy(float),
+    models["mix"] = fit_mix(stack_features(X.loc[mix_m], n_oof[mix_m]), y.loc[mix_m],
+                            X.loc[mix_m, "mvt_minus_sched"].to_numpy(float),
                             n_oof[mix_m], z_oof[mix_m], rounds["mix"], args.fast, cap=models.get("cap"))
     pred = pd.Series(predict_mix(models, X.loc[rm])[0], index=dep.loc[rm, ID].astype(str).to_numpy())
 
