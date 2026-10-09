@@ -439,6 +439,34 @@ class TestEndToEnd(unittest.TestCase):
 
 
 DATA = ROOT / "data"
+class TestDiagnose(unittest.TestCase):
+    def test_groups_rows_and_splits_clean_rows_by_stale_reach(self):
+        v = pd.DataFrame({
+            prc.ID: list("abcdef"), "airport": "EDDF",
+            "y": [600.0, 900.0, 9000.0, 100000.0, 5000.0, -30.0],
+            "pred": [620.0, 1500.0, 4000.0, 2000.0, 700.0, 100.0],
+            "normal": [620.0, 950.0, 600.0, 600.0, 700.0, 100.0],
+            "p_stale": 0.1, "mvt_minus_sched": [700.0, 7000.0, 9000.0, 50000.0, 100.0, 100.0],
+            "stale": [0.0, 0.0, 1.0, 0.0, 0.0, 0.0], "unmatched": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0]})
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "artifacts").mkdir()
+            v.to_parquet(Path(tmp) / "artifacts" / "val_predictions.parquet", index=False)
+            r = run_cli("diagnose", root=tmp)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("6 validation rows", r.stdout)
+        for text in ["late unmatched", "stale", "other", "y <= 0", "3600-7200s", "> 86400s"]:
+            self.assertIn(text, r.stdout)
+        self.assertIn("takeoff - scheduled > 3600s: 1 rows, RMSE model 600.0, normal-taxi model only 50.0",
+                      r.stdout)
+        self.assertIn("Largest squared errors", r.stdout)
+
+    def test_requires_validate_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = run_cli("diagnose", root=tmp)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("Run validate first", r.stderr)
+
+
 HAS_DATA = (DATA / "ranking.parquet").exists() and (DATA / "submitting.parquet").exists()
 
 

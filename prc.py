@@ -653,6 +653,48 @@ def cmd_validate(args):
     print(f"\nSaved {art / 'best_iter.json'}: {best}")
 
 
+def cmd_diagnose(args):
+    """Where validate's squared error sits, read from artifacts/val_predictions.parquet."""
+    _, art, _ = paths(args)
+    path = art / "val_predictions.parquet"
+    if not path.exists():
+        sys.exit(f"{path} not found. Run validate first.")
+    v = pd.read_parquet(path)
+    t = args.max_target
+    y, pred, normal, ms = (v[c].to_numpy(float) for c in ["y", "pred", "normal", "mvt_minus_sched"])
+    se = (pred - y) ** 2
+    clean = (y > 0) & (y <= t)
+    late = (v["unmatched"].to_numpy(float) == 1) & (ms > LATE_UNMATCHED_SEC)
+    group = np.where(clean, "clean", np.where(late, "late unmatched",
+                                              np.where(v["stale"].to_numpy(float) == 1, "stale", "other")))
+    edges = [-np.inf, 0, t, 2 * t, 6 * t, 24 * t, np.inf]
+    labels = ["y <= 0", "clean", f"{t:g}-{2 * t:g}s", f"{2 * t:g}-{6 * t:g}s", f"{6 * t:g}-{24 * t:g}s",
+              f"> {24 * t:g}s"]
+    v = v.assign(group=group, bucket=pd.cut(v["y"], edges, labels=labels), se=se)
+    print(f"{len(v):,} validation rows: RMSE all {np.sqrt(se.mean()):.2f}, clean {np.sqrt(se[clean].mean()):.2f}")
+
+    tail = v[~clean]
+    if len(tail):
+        g = tail.groupby(["group", "bucket"], observed=True).agg(
+            rows=("y", "size"), sse=("se", "sum"), mean_y=("y", "mean"), mean_pred=("pred", "mean"))
+        g["share"] = g["sse"] / se.sum()
+        g["rms_err"] = np.sqrt(g["sse"] / g["rows"])
+        print("\nRows outside the clean range, by group and target size (share = of total squared error):")
+        print(g.drop(columns="sse").round({"mean_y": 0, "mean_pred": 0, "share": 3, "rms_err": 0}).to_string())
+
+    print("\nClean rows, split by whether the stale term can reach them:")
+    for name, rows in [(f"takeoff - scheduled > {t:g}s", clean & (ms > t)),
+                       (f"takeoff - scheduled <= {t:g}s or unknown", clean & ~(ms > t))]:
+        if rows.any():
+            print(f"  {name}: {rows.sum():,} rows, RMSE model {rmse(pred[rows], y[rows]):.1f}, "
+                  f"normal-taxi model only {rmse(normal[rows], y[rows]):.1f}")
+
+    cols = [c for c in [ID, "airport", "group", "y", "pred", "normal", "p_stale", "mvt_minus_sched",
+                        "stale", "unmatched"] if c in v]
+    print("\nLargest squared errors:")
+    print(v.nlargest(15, "se")[cols].round(2).to_string(index=False))
+
+
 def cmd_submit(args):
     data, art, subs = paths(args)
     template = pd.read_parquet(single_file(data, "submitting"))
@@ -846,6 +888,10 @@ def main():
     s.set_defaults(func=cmd_upload)
 
     sub.add_parser("audit").set_defaults(func=cmd_audit)
+
+    s = sub.add_parser("diagnose", help="break down validate's errors (reads artifacts/val_predictions.parquet)")
+    s.add_argument("--max-target", type=float, default=3600, help="upper end of the clean range")
+    s.set_defaults(func=cmd_diagnose)
 
     s = sub.add_parser("validate")
     s.add_argument("--max-target", type=float, default=3600,
