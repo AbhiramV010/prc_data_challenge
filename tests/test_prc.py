@@ -449,6 +449,30 @@ class TestEndToEnd(unittest.TestCase):
 
 
 DATA = ROOT / "data"
+class TestScores(unittest.TestCase):
+    def test_record_score_keeps_one_line_per_version_in_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prc.record_score(tmp, 9)
+            prc.record_score(tmp, 8, "319.7223")
+            prc.record_score(tmp, 10)
+            prc.record_score(tmp, 9, "300.5")
+            prc.record_score(tmp, 8)  # pending does not erase a recorded score
+            text = (Path(tmp) / "scores.txt").read_text()
+        self.assertEqual(text.splitlines(), ["v8 319.7223", "v9 300.5", "v10 pending"])
+
+    def test_score_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(run_cli("score", "8", "319.7223", root=tmp).returncode, 0)
+            r = run_cli("score", "9", root=tmp)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("v9 pending", r.stdout)
+            bad = run_cli("score", "9", "abc", root=tmp)
+            self.assertNotEqual(bad.returncode, 0)
+            self.assertIn("not a number", bad.stderr)
+            text = (Path(tmp) / "scores.txt").read_text()
+        self.assertEqual(text.splitlines(), ["v8 319.7223", "v9 pending"])
+
+
 class TestDiagnose(unittest.TestCase):
     def test_groups_rows_and_splits_clean_rows_by_stale_reach(self):
         v = pd.DataFrame({

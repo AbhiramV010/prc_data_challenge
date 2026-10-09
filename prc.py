@@ -145,7 +145,7 @@ def cmd_upload(args):
 
     path = Path(args.file)
     key = args.as_name or path.name
-    m = re.fullmatch(r"(.+)_v\d+\.parquet", key)
+    m = re.fullmatch(r"(.+)_v(\d+)\.parquet", key)
     if not m:
         sys.exit(f"{key} does not follow <team-name>_v<N>.parquet. Use --as NAME.")
     data, _, _ = paths(args)
@@ -171,6 +171,40 @@ def cmd_upload(args):
             raise
     client.fput_object(bucket, key, str(path))
     print(f"Uploaded {path} -> {bucket}/{key}")
+    print(f"Logged v{int(m.group(2))} in {record_score(args.root, int(m.group(2)))}")
+
+
+SCORES_FILE = "scores.txt"
+
+
+def record_score(root, version, score=None):
+    """One 'v<N> <score>' line per submitted version in ROOT/scores.txt, in version order. A version
+    recorded without a score is 'pending' and keeps any score already there."""
+    path = Path(root) / SCORES_FILE
+    rows = {}
+    if path.exists():
+        for line in path.read_text().splitlines():
+            m = re.fullmatch(r"v(\d+)\s+(\S+)", line.strip())
+            if m:
+                rows[int(m.group(1))] = m.group(2)
+    if score is None:
+        rows.setdefault(version, "pending")
+    else:
+        rows[version] = score
+    path.write_text("".join(f"v{v} {s}\n" for v, s in sorted(rows.items())))
+    return path
+
+
+def cmd_score(args):
+    if args.score is not None:
+        try:
+            ok = bool(np.isfinite(float(args.score)))
+        except ValueError:
+            ok = False
+        if not ok:
+            sys.exit(f"{args.score!r} is not a number.")
+    path = record_score(args.root, args.version, args.score)
+    print(f"{path}:\n{path.read_text()}", end="")
 
 
 def to_utc(s):
@@ -909,6 +943,11 @@ def main():
     s = sub.add_parser("diagnose", help="break down validate's errors (reads artifacts/val_predictions.parquet)")
     s.add_argument("--max-target", type=float, default=3600, help="upper end of the clean range")
     s.set_defaults(func=cmd_diagnose)
+
+    s = sub.add_parser("score", help="record a version's leaderboard score in scores.txt")
+    s.add_argument("version", type=int)
+    s.add_argument("score", nargs="?", help="leaderboard RMSE; omit to mark the version pending")
+    s.set_defaults(func=cmd_score)
 
     s = sub.add_parser("validate")
     s.add_argument("--max-target", type=float, default=3600,
