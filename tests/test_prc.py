@@ -136,9 +136,10 @@ def tiny_departures():
         "AOBT_3_flt": [0.0] * n, "LOBT_flt": [0.0] * n,
     })
     events = pd.DataFrame({
-        "airport": s(["A"] * 4), "runway": s(["R"] * 4), "dep": [True, True, True, False],
+        "airport": s(["A"] * 4), "runway": s(["R"] * 4), "stand": s(["S1", "S2", "S1", "S1"]),
+        "dep": [True, True, True, False],
         "t": [600.0, 700.0, 1000.0, 300.0], "obt": [0.0, 100.0, 650.0, np.nan],
-        "inblk": [np.nan, np.nan, np.nan, 500.0],
+        "inblk": [np.nan, np.nan, np.nan, 500.0], "arr_stale": [np.nan, np.nan, np.nan, 1.0],
     })
     return dep, events
 
@@ -168,6 +169,11 @@ class TestBuildFeatures(unittest.TestCase):
         self.assertEqual(r["arrs_taxiing_at_obt"], 0)
         self.assertEqual(r["arrs_taxiing_at_t"], 0)   # in-block at 500
         self.assertEqual(r["pushbacks_prev15"], 2)
+
+    def test_arrival_stale_shares(self):
+        # The one arrival (stand S1, landed at 300) was logged stale; it precedes every departure.
+        np.testing.assert_array_equal(self.X["arr_stale_apt_m180"], [1.0, 1.0, 1.0])
+        np.testing.assert_array_equal(self.X["arr_stale_stand_m720"], [1.0, np.nan, 1.0])
 
     def test_first_departure_has_no_previous_gap(self):
         self.assertTrue(np.isnan(self.X["rwy_gap_prev_dep"].iloc[0]))

@@ -248,10 +248,14 @@ def load(data: Path, use_obt=False) -> tuple[pd.DataFrame, pd.DataFrame]:
         obt = to_secs(to_utc(df["AOBT_3_flt"])).fillna(eobt) if use_obt else eobt
         # Departure block times are blanked in ranking, so only arrival in-block times are used.
         inblk = to_secs(to_utc(df["BLOCK_TIME_UTC_mvt"])).where(~is_dep)
+        # An arrival whose in-block equals its schedule: the feed logged the schedule as actual.
+        arr_gap = (inblk - to_secs(to_utc(df["SCHED_TIME_UTC_mvt"]))).abs()
         events.append(pd.DataFrame({"airport": df["airport"],
                                     "runway": df["RUNWAY_mvt"].astype("string"),
+                                    "stand": df["STAND_mvt"].astype("string"),
                                     "dep": is_dep, "t": df["t"], "obt": obt.where(is_dep),
-                                    "inblk": inblk}))
+                                    "inblk": inblk,
+                                    "arr_stale": (arr_gap <= STALE_SEC).astype(float).where(arr_gap.notna())}))
         d = df[is_dep].copy()
         m = mvt[is_dep]
         d["year"], d["month"] = m.dt.year, m.dt.month
@@ -350,6 +354,8 @@ def window_means(ev_key: pd.Series, ev_t: pd.Series, ev_val, q_key: pd.Series, q
 
 
 STATE_WINDOWS = [("m60", -3600, 0), ("m180", -10800, 0), ("pm60", -3600, 3600)]
+ARR_STALE_APT_WINDOWS = [("m180", -10800, 0), ("pm180", -10800, 10800), ("pm720", -43200, 43200)]
+ARR_STALE_STAND_WINDOWS = [("m180", -10800, 0), ("m720", -43200, 0)]
 
 
 def build_features(dep, events, use_obt=False):
@@ -408,6 +414,16 @@ def build_features(dep, events, use_obt=False):
     push_to = (events["t"] - events["obt"]).clip(0, 7200)[is_d]
     for prefix, ek, et, val in [("arr_taxiin", ak, at, taxi_in), ("dep_push_to", dk, dt, push_to)]:
         for name, col in window_means(ek, et, val, apt, t, STATE_WINDOWS).items():
+            X[f"{prefix}_{name}"] = col
+
+    # Share of arrivals logged with the schedule as in-block, around takeoff at the airport and
+    # before it at the stand (where the inbound aircraft usually parked). Ranking keeps arrival
+    # block times, and a feed that logs schedules as actuals tends to do it for departures too.
+    a_stale = events["arr_stale"][~is_d]
+    a_stand = (events["airport"] + "|" + events["stand"])[~is_d]
+    for prefix, ek, qk, windows in [("arr_stale_apt", ak, apt, ARR_STALE_APT_WINDOWS),
+                                    ("arr_stale_stand", a_stand, X["apt_stand"], ARR_STALE_STAND_WINDOWS)]:
+        for name, col in window_means(ek, at, a_stale, qk, t, windows).items():
             X[f"{prefix}_{name}"] = col
 
     # Duplicate or ghost movement records: the copy with an early block time has a huge target.
