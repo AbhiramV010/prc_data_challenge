@@ -689,6 +689,23 @@ def cmd_diagnose(args):
             print(f"  {name}: {rows.sum():,} rows, RMSE model {rmse(pred[rows], y[rows]):.1f}, "
                   f"normal-taxi model only {rmse(normal[rows], y[rows]):.1f}")
 
+    # Post-hoc changes to the stale term from the saved columns; the first row reproduces validate.
+    # Late unmatched rows keep their per-airport rates. y <= LATE_UNMATCHED_SEC leaves out the few
+    # extreme rows that dominate squared error and differ from month to month.
+    p, bulk = v["p_stale"].to_numpy(float), y <= LATE_UNMATCHED_SEC
+
+    def what_if(cap, k):
+        m = np.where(np.isnan(ms), normal, np.clip(np.nan_to_num(ms), 0, cap))
+        return np.where(late, pred, np.clip(normal + k * p * (m - normal), 0, None))
+
+    print("\nWhat if the stale term were changed after the fact (no retraining)?")
+    print(f"  {'stale cap':>10}{'p scale':>8}{'all':>9}{'clean':>9}{'y<=%d' % LATE_UNMATCHED_SEC:>10}")
+    for cap, k in [(None, 1.0), (24 * t, 1.0), (6 * t, 1.0), (2 * t, 1.0), (t, 1.0),
+                   (None, 0.8), (None, 0.6), (None, 0.4)]:
+        alt = what_if(cap, k)
+        print(f"  {'none' if cap is None else f'{cap:g}':>10}{k:>8.1f}{rmse(alt, y):>9.2f}"
+              f"{rmse(alt[clean], y[clean]):>9.2f}{rmse(alt[bulk], y[bulk]):>10.2f}")
+
     cols = [c for c in [ID, "airport", "group", "y", "pred", "normal", "p_stale", "mvt_minus_sched",
                         "stale", "unmatched"] if c in v]
     print("\nLargest squared errors:")

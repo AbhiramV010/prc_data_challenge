@@ -401,6 +401,16 @@ class TestEndToEnd(unittest.TestCase):
         self.assertNotIn("Late unmatched", r.stdout)
         self.assertIn("RMSE all rows", r.stdout)
 
+    def test_diagnose_what_if_reproduces_validate(self):
+        r = run_cli("validate", "--fast", "--use-actual-obt", root=self.root)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = run_cli("diagnose", root=self.root)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        head = re.search(r"RMSE all ([\d.]+)", r.stdout)
+        first = re.search(r"^\s+none\s+1\.0\s+([\d.]+)", r.stdout, re.M)
+        assert head and first, r.stdout
+        self.assertEqual(first.group(1), head.group(1))
+
     def test_load_labels_stale_blocks_on_training_rows_only(self):
         dep, _ = prc.load(self.root / "data")
         train, rank = dep[dep["split"].eq("train")], dep[dep["split"].eq("rank")]
