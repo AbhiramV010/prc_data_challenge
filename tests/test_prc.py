@@ -322,14 +322,12 @@ def run_cli(*args, root):
 RESULTS_CSV = ROOT / "results.csv"
 RESULT_FIELDS = ["run_at", "dataset", "rows_clean", "model_rmse_clean", "baseline_rmse_clean",
                  "model_rmse_all", "baseline_rmse_all", "best_iter"]
-RMSE_REPORT: list[str] = []
 RMSE_RESULTS: list[dict] = []
+FINAL_RMSE: list[float] = []  # competition-data model RMSE (clean rows), shown after all tests
 
 
 def report_rmse(label, stdout):
-    """Keep validate's RMSE lines for the summary and results.csv written after all tests."""
-    RMSE_REPORT.append(label)
-    RMSE_REPORT.extend("  " + line for line in stdout.splitlines() if line.startswith("RMSE"))
+    """Keep validate's RMSE values for the results.csv rows written after all tests."""
     clean = re.search(r"RMSE clean \(.*?([\d,]+) rows\): model ([\d.]+)\s.*?airport-mean baseline ([\d.]+)",
                       stdout)
     every = re.search(r"RMSE all rows \([\d,]+\): model ([\d.]+)\s.*?airport-mean baseline ([\d.]+)", stdout)
@@ -344,14 +342,12 @@ def report_rmse(label, stdout):
 
 
 def rmse_summary():
-    """Final RMSE values from every validate run, printed after all tests (see conftest.py)."""
-    if not RMSE_REPORT:
-        return ""
-    return "\n".join(["++==++==", "Final RMSE (seconds)", *RMSE_REPORT, "++==++=="])
+    """The competition-data RMSE, printed after all tests (see conftest.py)."""
+    return f"Final RMSE: {FINAL_RMSE[-1]:.2f}" if FINAL_RMSE else ""
 
 
 def tearDownModule():
-    if "pytest" not in sys.modules:  # under pytest, conftest.py prints it so capturing can't hide it
+    if "pytest" not in sys.modules and FINAL_RMSE:  # under pytest, conftest.py prints it so capturing can't hide it
         print("\n" + rmse_summary(), file=sys.stderr)
     if RMSE_RESULTS:
         run_at = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -501,6 +497,7 @@ class TestCompetitionData(unittest.TestCase):
         m = re.search(r"RMSE clean .*model ([\d.]+) .*baseline ([\d.]+)", r.stdout)
         assert m, r.stdout
         model, baseline = float(m.group(1)), float(m.group(2))
+        FINAL_RMSE.append(model)
         self.assertLess(model, baseline)
         # The default prices the tail (leaderboard v8, capped at max_target, scored 319.7 on all rows;
         # on this validation the capped run scored 566.4 all rows / 224.8 clean and the earlier
