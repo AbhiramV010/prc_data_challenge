@@ -395,6 +395,16 @@ class TestEndToEnd(unittest.TestCase):
         self.assertFalse(out[prc.TARGET].isna().any())
         self.assertTrue((out[prc.TARGET] >= 0).all())
 
+    def test_tail_pricing_is_default_and_no_tail_caps(self):
+        r = run_cli("validate", "--fast", "--use-actual-obt", root=self.root)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Late unmatched", r.stdout)
+        self.assertIn("Squared error by row group", r.stdout)
+        r = run_cli("validate", "--fast", "--use-actual-obt", "--no-tail", root=self.root)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Late unmatched", r.stdout)
+        self.assertIn("RMSE all rows", r.stdout)
+
     def test_load_labels_stale_blocks_on_training_rows_only(self):
         dep, _ = prc.load(self.root / "data")
         train, rank = dep[dep["split"].eq("train")], dep[dep["split"].eq("rank")]
@@ -492,13 +502,15 @@ class TestCompetitionData(unittest.TestCase):
         assert m, r.stdout
         model, baseline = float(m.group(1)), float(m.group(2))
         self.assertLess(model, baseline)
-        self.assertLess(model, 240)  # fast run scored 227.7; guards against regressions
+        # The default prices the tail (leaderboard v8, capped at max_target, scored 319.7 on all rows;
+        # on this validation the capped run scored 566.4 all rows / 224.8 clean and the earlier
+        # uncapped run 383.1 / 263.5). Loose bounds until the first tail-mode run sets real ones.
+        self.assertLess(model, 280)
 
-        # Default mode caps predictions at max_target, so huge stale targets are not priced:
-        # all rows still beats the airport-mean baseline but is far above the clean score.
         m = re.search(r"RMSE all rows .*model ([\d.]+) .*baseline ([\d.]+)", r.stdout)
         assert m, r.stdout
         self.assertLess(float(m.group(1)), float(m.group(2)))
+        self.assertLess(float(m.group(1)), 480)  # the capped run's 566.4 must be beaten by a wide margin
 
 
 if __name__ == "__main__":

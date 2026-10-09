@@ -620,6 +620,12 @@ def cmd_validate(args):
     sv = stale.loc[vm].to_numpy(float)
     print(f"Stale-block share {np.nanmean(sv):.3f}; mean P(stale) when stale {p[sv == 1].mean():.3f}, "
           f"when not {p[sv == 0].mean():.3f}")
+    se, lu = (pred - yv) ** 2, late_unmatched(Xv)
+    print("Squared error by row group (rows, share of total, RMS error):")
+    for name, g in [("clean", c), ("late unmatched", ~c & lu), ("stale, not clean", ~c & ~lu & (sv == 1)),
+                    ("other, not clean", ~c & ~lu & (sv != 1))]:
+        if g.any():
+            print(f"  {name:<17}{g.sum():>9,}{se[g].sum() / se.sum():>8.1%}{np.sqrt(se[g].mean()):>9.0f}s")
 
     per = pd.DataFrame({"airport": dep.loc[vm, "airport"].to_numpy(), "y": yv, "p": pred, "b": base,
                         "clean": c})
@@ -846,9 +852,10 @@ def main():
                    help="normal-taxi regressor ignores taxi-out above this many seconds")
     s.add_argument("--fast", action="store_true")
     s.add_argument("--use-actual-obt", action="store_true")
-    s.add_argument("--tail", action="store_true",
+    s.add_argument("--tail", action=argparse.BooleanOptionalAction, default=True,
                    help="price huge late-unmatched targets with per-airport rates and leave the stale "
-                        "term uncapped; only pays off if the scored months contain such rows")
+                        "term uncapped, since the leaderboard scores every row; --no-tail caps "
+                        "predictions at max-target")
     s.set_defaults(func=cmd_validate)
 
     s = sub.add_parser("submit")
@@ -859,9 +866,10 @@ def main():
     s.add_argument("--rounds", type=int)
     s.add_argument("--fast", action="store_true")
     s.add_argument("--use-actual-obt", action="store_true")
-    s.add_argument("--tail", action="store_true",
+    s.add_argument("--tail", action=argparse.BooleanOptionalAction, default=True,
                    help="price huge late-unmatched targets with per-airport rates and leave the stale "
-                        "term uncapped; only pays off if the scored months contain such rows")
+                        "term uncapped, since the leaderboard scores every row; --no-tail caps "
+                        "predictions at max-target")
     s.set_defaults(func=cmd_submit)
 
     s = sub.add_parser("synth", help="write small synthetic data for testing")
