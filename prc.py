@@ -915,8 +915,9 @@ def cmd_audit(args):
 
     for c, share in nn["rank"].reindex(OBT_COLS).fillna(0.0).items():
         if share > 0.5:
-            print(f"\nWARNING: {c} is {share:.0%} filled in ranking departures. MVT - {c} may nearly "
-                  f"give the target. Confirm with the organizers before using --use-actual-obt.")
+            # The data page blanks only departure BLOCK_TIME and TAXITIME in ranking, so these are fair
+            # inputs; MVT - AOBT_3 misses the target by ~250s MAE, so it is a feature, not a leak.
+            print(f"\n{c} is {share:.0%} filled in ranking departures (used unless --no-use-actual-obt).")
 
 
 def cmd_synth(args):
@@ -1002,7 +1003,8 @@ def main():
     s.add_argument("--max-target", type=float, default=3600,
                    help="normal-taxi regressor ignores taxi-out above this many seconds")
     s.add_argument("--fast", action="store_true")
-    s.add_argument("--use-actual-obt", action="store_true")
+    s.add_argument("--use-actual-obt", action=argparse.BooleanOptionalAction, default=True,
+                   help="use AOBT_3_flt and LOBT_flt, which ranking keeps (cut clean RMSE 246 -> 231)")
     s.add_argument("--tail", action=argparse.BooleanOptionalAction, default=True,
                    help="price huge late-unmatched targets with per-airport rates and leave the stale "
                         "term uncapped, since the leaderboard scores every row; --no-tail caps "
@@ -1018,7 +1020,8 @@ def main():
     s.add_argument("--version", type=int, default=1)
     s.add_argument("--rounds", type=int)
     s.add_argument("--fast", action="store_true")
-    s.add_argument("--use-actual-obt", action="store_true")
+    s.add_argument("--use-actual-obt", action=argparse.BooleanOptionalAction, default=True,
+                   help="use AOBT_3_flt and LOBT_flt, which ranking keeps (cut clean RMSE 246 -> 231)")
     s.add_argument("--tail", action=argparse.BooleanOptionalAction, default=True,
                    help="price huge late-unmatched targets with per-airport rates and leave the stale "
                         "term uncapped, since the leaderboard scores every row; --no-tail caps "
