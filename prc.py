@@ -862,6 +862,24 @@ def cmd_submit(args):
           f"min {values.min():.1f}s, max {values.max():.1f}s")
 
 
+def cmd_hybrid(args):
+    """Taxi-out rows from one submission, tail rows from another. AOBT_3 sharpens normal taxi-outs
+    but shrinks the stale term on delayed flights, which cost 10 RMSE on the leaderboard (v10 326.3
+    vs v9 315.8). Where either file predicts more than --threshold s, the tail file's value is used."""
+    _, _, subs = paths(args)
+    taxi, tail = pd.read_parquet(args.taxi), pd.read_parquet(args.tail)
+    if not taxi[ID].equals(tail[ID]):
+        sys.exit("The two files do not list the same MVT_ID_mvt in the same order.")
+    a, b = taxi[TARGET].to_numpy(float), tail[TARGET].to_numpy(float)
+    use_tail = np.maximum(a, b) > args.threshold
+    out = taxi[[ID]].copy()
+    out[TARGET] = np.where(use_tail, b, a).astype(taxi[TARGET].dtype)
+    subs.mkdir(parents=True, exist_ok=True)
+    path = subs / f"{args.name}_v{args.version}.parquet"
+    out.to_parquet(path, index=False)
+    print(f"Wrote {path}: {use_tail.sum():,} of {len(out):,} rows from {args.tail}")
+
+
 def cmd_audit(args):
     data, _, _ = paths(args)
     files = [("train", f) for f in training_files(data)] + [("rank", single_file(data, "ranking"))]
@@ -1003,6 +1021,14 @@ def main():
     s = sub.add_parser("diagnose", help="break down validate's errors (reads artifacts/val_predictions.parquet)")
     s.add_argument("--max-target", type=float, default=3600, help="upper end of the clean range")
     s.set_defaults(func=cmd_diagnose)
+
+    s = sub.add_parser("hybrid", help="normal taxi-outs from one submission, the tail from another")
+    s.add_argument("taxi", help="submission for rows both files predict at or under --threshold")
+    s.add_argument("tail", help="submission for the rest")
+    s.add_argument("--threshold", type=float, default=3600)
+    s.add_argument("--name", required=True)
+    s.add_argument("--version", type=int, required=True)
+    s.set_defaults(func=cmd_hybrid)
 
     s = sub.add_parser("score", help="record a version's leaderboard score in scores.txt")
     s.add_argument("version", type=int)

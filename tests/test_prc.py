@@ -533,6 +533,21 @@ class TestScores(unittest.TestCase):
         self.assertEqual(text.splitlines(), ["v8 319.7223", "v9 pending"])
 
 
+class TestHybrid(unittest.TestCase):
+    def test_tail_rows_come_from_the_tail_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ids = [1.0, 2.0, 3.0, 4.0]
+            pd.DataFrame({prc.ID: ids, prc.TARGET: [900.0, 4000.0, 800.0, 700.0]}).to_parquet(f"{tmp}/taxi.parquet")
+            pd.DataFrame({prc.ID: ids, prc.TARGET: [950.0, 9000.0, 5000.0, 750.0]}).to_parquet(f"{tmp}/tail.parquet")
+            r = run_cli("hybrid", "taxi.parquet", "tail.parquet", "--name", "t", "--version", "3", root=tmp)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            out = pd.read_parquet(f"{tmp}/submissions/t_v3.parquet")
+            self.assertEqual(out[prc.TARGET].tolist(), [900.0, 9000.0, 5000.0, 700.0])
+            pd.DataFrame({prc.ID: ids[::-1], prc.TARGET: [1.0] * 4}).to_parquet(f"{tmp}/tail.parquet")
+            bad = run_cli("hybrid", "taxi.parquet", "tail.parquet", "--name", "t", "--version", "4", root=tmp)
+            self.assertNotEqual(bad.returncode, 0)
+
+
 class TestDiagnose(unittest.TestCase):
     def test_groups_rows_and_splits_clean_rows_by_stale_reach(self):
         v = pd.DataFrame({
