@@ -175,6 +175,36 @@ class TestBuildFeatures(unittest.TestCase):
         np.testing.assert_array_equal(self.X["arr_stale_apt_m180"], [1.0, 1.0, 1.0])
         np.testing.assert_array_equal(self.X["arr_stale_stand_m720"], [1.0, np.nan, 1.0])
 
+    def test_stand_occupancy_gaps(self):
+        # The only arrival blocked in at 500 on stand S1; pushbacks are at 0, 100, 650 and schedules at 0.
+        np.testing.assert_array_equal(self.X["stand_prev_arr_t"], [100, np.nan, 500])  # takeoffs 600, 700, 1000
+        np.testing.assert_array_equal(self.X["stand_next_arr_t"], [np.nan] * 3)
+        np.testing.assert_array_equal(self.X["stand_prev_arr_obt"], [np.nan, np.nan, 150])
+        np.testing.assert_array_equal(self.X["stand_next_arr_obt"], [500, np.nan, np.nan])
+        np.testing.assert_array_equal(self.X["stand_next_arr_sched"], [500, np.nan, 500])
+        self.assertTrue(self.X["stand_prev_arr_sched"].isna().all())
+
+    def test_time_difference_features(self):
+        dep, events = tiny_departures()
+        dep["SCHED_TIME_UTC_mvt"] = [10.0, 20.0, 30.0]
+        dep["EOBT_1_flt"] = [100.0, 200.0, 305.0]
+        dep["IOBT_flt"] = [160.0, 260.0, 365.0]
+        dep["AOBT_3_flt"] = [190.0, 290.0, 395.0]
+        dep["LOBT_flt"] = [70.0, 80.0, 90.0]
+        X = prc.build_features(dep, events, use_obt=True)
+        for col, want in {"eobt1_minus_sched": [90, 180, 275], "iobt_minus_eobt1": [60, 60, 60],
+                          "aobt3_minus_sched": [180, 270, 365], "aobt3_minus_eobt1": [90, 90, 90],
+                          "aobt3_minus_iobt": [30, 30, 30], "aobt3_minus_lobt": [120, 210, 305],
+                          "lobt_minus_sched": [60, 60, 60], "aobt3_sec": [10, 50, 35],
+                          "t_sec": [0, 40, 40]}.items():
+            np.testing.assert_array_equal(X[col], want, err_msg=col)
+        np.testing.assert_allclose(X["eobt1_min5"], [100 / 60, 200 / 60, 5 / 60])
+        np.testing.assert_allclose(X["sched_min5"], [10 / 60, 20 / 60, 30 / 60])
+        # The planned-time differences stay without the flag; the ones using actual off-block time do not.
+        X = prc.build_features(dep, events, use_obt=False)
+        self.assertIn("eobt1_minus_sched", X)
+        self.assertFalse(any(str(c).startswith(("aobt3", "lobt")) for c in X))
+
     def test_first_departure_has_no_previous_gap(self):
         self.assertTrue(np.isnan(self.X["rwy_gap_prev_dep"].iloc[0]))
 
@@ -353,7 +383,7 @@ RESULTS_CSV = ROOT / "results.csv"
 RESULT_FIELDS = ["run_at", "dataset", "rows_clean", "model_rmse_clean", "baseline_rmse_clean",
                  "model_rmse_all", "baseline_rmse_all", "best_iter"]
 RMSE_RESULTS: list[dict] = []
-FINAL_RMSE: list[float] = []  # competition-data model RMSE (clean rows), shown after all tests
+FINAL_RMSE: list[float] = []  # competition-data model RMSE (all rows, as ranked), shown after all tests
 
 
 def report_rmse(label, stdout):
@@ -586,10 +616,13 @@ class TestCompetitionData(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr[-2000:])
         report_rmse("Competition data (fast run, 30% of training rows)", r.stdout)
 
+        m = re.search(r"RMSE all rows .*model ([\d.]+) .*baseline ([\d.]+)", r.stdout)
+        assert m, r.stdout
+        FINAL_RMSE.append(float(m.group(1)))  # the ranking scores every departure, not just clean rows
+
         m = re.search(r"RMSE clean .*model ([\d.]+) .*baseline ([\d.]+)", r.stdout)
         assert m, r.stdout
         model, baseline = float(m.group(1)), float(m.group(2))
-        FINAL_RMSE.append(model)
         self.assertLess(model, baseline)
         # The default prices the tail (leaderboard v8, capped at max_target, scored 319.7 on all rows;
         # on this validation the capped run scored 566.4 all rows / 224.8 clean and the earlier

@@ -10,3 +10,5 @@ run_at,dataset,rows_clean,model_rmse_clean,baseline_rmse_clean,model_rmse_all,ba
 2026-10-06 19:23:26,Synthetic test data (fake; only shows the pipeline works),1536,16.92,122.13,16.92,122.13,49
 2026-10-09 13:57:04,"Competition data (fast run, 30% of training rows)",343355,224.77,375.94,566.36,659.96,269
 2026-10-09 13:57:04,Synthetic test data (fake; only shows the pipeline works),1536,16.92,122.13,16.92,122.13,49
+2026-10-10 00:40:09,"Competition data (fast run, 30% of training rows)",343355,236.33,375.94,336.6,659.96,331
+2026-10-10 00:40:09,Synthetic test data (fake; only shows the pipeline works),1536,16.28,122.13,16.28,122.13,55

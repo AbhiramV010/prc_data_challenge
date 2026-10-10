@@ -377,9 +377,18 @@ def build_features(dep, events, use_obt=False):
     X["mvt_minus_sched"] = dep["t"] - dep["SCHED_TIME_UTC_mvt"]
     X["mvt_minus_eobt1"] = dep["t"] - dep["EOBT_1_flt"]
     X["mvt_minus_iobt"] = dep["t"] - dep["IOBT_flt"]
+    # Differences between the flight-list times, which trees cannot form from the gaps to takeoff,
+    # and the rounding of times (minute within five, second).
+    sched, eobt, iobt = dep["SCHED_TIME_UTC_mvt"], dep["EOBT_1_flt"], dep["IOBT_flt"]
+    X["eobt1_minus_sched"], X["iobt_minus_eobt1"] = eobt - sched, iobt - eobt
+    X["eobt1_min5"], X["sched_min5"], X["t_sec"] = (eobt % 300) / 60, (sched % 300) / 60, dep["t"] % 60
     if use_obt:
-        X["mvt_minus_aobt3"] = dep["t"] - dep["AOBT_3_flt"]
-        X["mvt_minus_lobt"] = dep["t"] - dep["LOBT_flt"]
+        aobt, lobt = dep["AOBT_3_flt"], dep["LOBT_flt"]
+        X["mvt_minus_aobt3"] = dep["t"] - aobt
+        X["mvt_minus_lobt"] = dep["t"] - lobt
+        X["aobt3_minus_sched"], X["aobt3_minus_eobt1"] = aobt - sched, aobt - eobt
+        X["aobt3_minus_iobt"], X["aobt3_minus_lobt"] = aobt - iobt, aobt - lobt
+        X["lobt_minus_sched"], X["aobt3_sec"] = lobt - sched, aobt % 60
 
     ev_rwy = events["airport"] + "|" + events["runway"]
     is_d = events["dep"].to_numpy()
@@ -425,6 +434,12 @@ def build_features(dep, events, use_obt=False):
                                     ("arr_stale_stand", a_stand, X["apt_stand"], ARR_STALE_STAND_WINDOWS)]:
         for name, col in window_means(ek, at, a_stale, qk, t, windows).items():
             X[f"{prefix}_{name}"] = col
+
+    # Stand occupancy from arrival in-block times, which ranking keeps: an aircraft cannot push back
+    # before it blocks in, and the stand's next arrival comes after it leaves. This bounds the
+    # off-block time without the rough flight-list times.
+    for name, q in [("t", t), ("obt", obt), ("sched", sched)]:
+        X[f"stand_prev_arr_{name}"], X[f"stand_next_arr_{name}"] = neighbor_gaps(a_stand, a_in, X["apt_stand"], q)
 
     # Duplicate or ghost movement records: the copy with an early block time has a huge target.
     X["actype_mvt_missing"] = dep["AIRCRAFT_TYPE_mvt"].isna().astype(float)
