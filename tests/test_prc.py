@@ -286,6 +286,30 @@ class TestModelHelpers(unittest.TestCase):
         np.testing.assert_allclose(uncapped, [45350.0, 750.0])
         np.testing.assert_allclose(capped, [2150.0, 750.0])  # the stale term is limited to max_target
 
+    def test_predict_mix_p_scale_shrinks_the_stale_term(self):
+        class Fixed:
+            def __init__(self, values):
+                self.values = np.array(values, dtype=float)
+
+            def predict(self, X, raw_score=False):
+                return self.values
+
+        X = pd.DataFrame({"mvt_minus_sched": [90000.0, 800.0]})
+        models = {"stale": Fixed([0.5, 0.5]), "reg": Fixed([700.0, 700.0]), "p_scale": 0.5}
+        pred, p, _ = prc.predict_mix(models, X)
+        np.testing.assert_allclose(p, [0.25, 0.25])
+        np.testing.assert_allclose(pred, [0.25 * 90000 + 0.75 * 700, 0.25 * 800 + 0.75 * 700])
+
+    def test_submit_rounds_rescales_for_learning_rate(self):
+        best = {"reg": 269, "stale": 75, "mix": 79, "lr": 0.1}
+        # validate --fast (lr 0.1) then a full fit (lr 0.05): twice the rounds, blend booster unchanged.
+        self.assertEqual(prc.submit_rounds(best, fast=False), {"reg": 591, "stale": 165, "mix": 86})
+        self.assertEqual(prc.submit_rounds(best, fast=True), {"reg": 295, "stale": 82, "mix": 86})
+        old = {"reg": 269, "stale": 75, "mix": 79}  # no "lr": no rescaling
+        self.assertEqual(prc.submit_rounds(old, fast=False), {"reg": 295, "stale": 82, "mix": 86})
+        self.assertEqual(prc.submit_rounds({"reg": 10, "stale": 10, "mix": 10, "lr": 0.1}, fast=True),
+                         {"reg": 50, "stale": 50, "mix": 50})
+
     def test_mix_rows(self):
         X = pd.DataFrame({"unmatched": [1.0, 1.0, 0.0, 1.0],
                           "mvt_minus_sched": [prc.LATE_UNMATCHED_SEC + 1, 100.0, 100.0, 100.0]})
@@ -386,7 +410,7 @@ class TestEndToEnd(unittest.TestCase):
         self.assertIn("RMSE clean", r.stdout)
         report_rmse("Synthetic test data (fake; only shows the pipeline works)", r.stdout)
         best = json.loads((self.root / "artifacts" / "best_iter.json").read_text())
-        self.assertEqual(set(best), {"reg", "stale", "mix"})
+        self.assertEqual(set(best), {"reg", "stale", "mix", "lr"})
 
         r = run_cli("submit", "--name", "team", "--fast", "--use-actual-obt", root=self.root)
         self.assertEqual(r.returncode, 0, r.stderr)

@@ -463,6 +463,16 @@ def lgb_params(fast, objective="regression"):
             "cat_l2": 10, "max_cat_threshold": 64, "verbose": -1, "seed": 0}
 
 
+def submit_rounds(best, fast):
+    """Rounds for the final fit from validate's best iterations: ~10% longer for the extra training
+    rows, and for the two LightGBM models scaled by the learning-rate ratio, since validate --fast
+    trains at 0.1 and a full fit at 0.05 needs about twice the rounds. The blend booster's learning
+    rate is the same in both modes. A file without "lr" predates this and is not rescaled."""
+    scale = best.get("lr", lgb_params(fast)["learning_rate"]) / lgb_params(fast)["learning_rate"]
+    return {k: max(int(best[k] * 1.1 * (scale if k != "mix" else 1)), 50)
+            for k in ("reg", "stale", "mix") if k in best}
+
+
 def fit(X, y, rounds, fast, Xv=None, yv=None, objective="regression"):
     import lightgbm as lgb
     dtr = lgb.Dataset(X, y, categorical_feature=CAT_FEATS, free_raw_data=True)
@@ -536,6 +546,9 @@ def predict_mix(models, X):
         p = sigmoid(np.asarray(z, dtype=float))
     else:
         p = np.asarray(models["stale"].predict(X), dtype=float)
+    # The blend booster is overconfident on delayed flights: scaling P(stale) by 0.8 after the fact
+    # cut clean RMSE by 8s on Jan/Jul 2025 with no loss on rows up to 6h (see diagnose).
+    p = p * models.get("p_scale", 1.0)
     n, m = blend_parts(normal, X["mvt_minus_sched"].to_numpy(float), models.get("cap"))
     pred = p * m + (1 - p) * n
     rates = models.get("late_rates")
@@ -653,6 +666,7 @@ def cmd_validate(args):
     models["mix"] = fit_mix(stack_features(X.loc[mix_m], n_oof[mix_m]), y.loc[mix_m],
                             X.loc[mix_m, "mvt_minus_sched"].to_numpy(float),
                             n_oof[mix_m], z_oof[mix_m], 3000, args.fast, valid, models.get("cap"))
+    models["p_scale"] = args.p_scale
     Xv = X.loc[vm]
     pred, p, normal = predict_mix(models, Xv)
     yv = y.loc[vm].to_numpy(float)
@@ -699,6 +713,7 @@ def cmd_validate(args):
                   "unmatched": Xv["unmatched"].to_numpy(float)}).to_parquet(art / "val_predictions.parquet",
                                                                           index=False)
     best["mix"] = models["mix"].best_iteration
+    best["lr"] = lgb_params(args.fast)["learning_rate"]
     (art / "best_iter.json").write_text(json.dumps(best))
     print(f"\nSaved {art / 'best_iter.json'}: {best}")
 
@@ -775,8 +790,10 @@ def cmd_submit(args):
     if args.rounds:
         rounds.update(reg=args.rounds, stale=args.rounds)
     elif best.exists():
-        # More training rows than in validation, so train ~10% longer.
-        rounds.update({k: max(int(v * 1.1), 50) for k, v in json.loads(best.read_text()).items()})
+        saved = json.loads(best.read_text())
+        if "lr" not in saved:
+            print(f"{best} has no learning rate; rerun validate so rounds match this fit's learning rate")
+        rounds.update(submit_rounds(saved, args.fast))
     print(f"regressor rows {reg_m.sum():,}, classifier rows {stale_m.sum():,}, "
           f"ranking departures {rm.sum():,}, rounds {rounds}")
     y = pd.Series(dep[TARGET], dtype=float)
@@ -793,6 +810,7 @@ def cmd_submit(args):
     models["mix"] = fit_mix(stack_features(X.loc[mix_m], n_oof[mix_m]), y.loc[mix_m],
                             X.loc[mix_m, "mvt_minus_sched"].to_numpy(float),
                             n_oof[mix_m], z_oof[mix_m], rounds["mix"], args.fast, cap=models.get("cap"))
+    models["p_scale"] = args.p_scale
     pred = pd.Series(predict_mix(models, X.loc[rm])[0], index=dep.loc[rm, ID].astype(str).to_numpy())
 
     tid = template[ID].astype(str)
@@ -974,6 +992,8 @@ def main():
                    help="price huge late-unmatched targets with per-airport rates and leave the stale "
                         "term uncapped, since the leaderboard scores every row; --no-tail caps "
                         "predictions at max-target")
+    s.add_argument("--p-scale", type=float, default=0.8,
+                   help="multiply the blend's P(stale) by this; 1 keeps the booster's probability")
     s.set_defaults(func=cmd_validate)
 
     s = sub.add_parser("submit")
@@ -988,6 +1008,8 @@ def main():
                    help="price huge late-unmatched targets with per-airport rates and leave the stale "
                         "term uncapped, since the leaderboard scores every row; --no-tail caps "
                         "predictions at max-target")
+    s.add_argument("--p-scale", type=float, default=0.8,
+                   help="multiply the blend's P(stale) by this; 1 keeps the booster's probability")
     s.set_defaults(func=cmd_submit)
 
     s = sub.add_parser("synth", help="write small synthetic data for testing")
