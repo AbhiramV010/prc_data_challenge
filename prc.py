@@ -94,14 +94,26 @@ def minio_keys():
     sys.exit("Set PRC_ACCESS_KEY and PRC_SECRET_KEY in .env or the environment.")
 
 
-def cmd_download(args):
+def minio_client():
+    """MinIO client, through HTTPS_PROXY when one is set (cloud sessions have no direct DNS)."""
     from minio import Minio
+
+    access, secret = minio_keys()
+    http = None
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    if proxy:
+        import urllib3
+        http = urllib3.ProxyManager(proxy, ca_certs=os.environ.get("SSL_CERT_FILE"),
+                                    retries=urllib3.Retry(total=3, backoff_factor=0.5))
+    return Minio(ENDPOINT, access_key=access, secret_key=secret, secure=True, http_client=http)
+
+
+def cmd_download(args):
     from minio.error import S3Error
 
     data, _, _ = paths(args)
     data.mkdir(parents=True, exist_ok=True)
-    access, secret = minio_keys()
-    client = Minio(ENDPOINT, access_key=access, secret_key=secret, secure=True)
+    client = minio_client()
 
     def challenge_objects(bucket):
         return [o for o in client.list_objects(bucket, recursive=True)
@@ -140,7 +152,6 @@ def cmd_download(args):
 
 
 def cmd_upload(args):
-    from minio import Minio
     from minio.error import S3Error
 
     path = Path(args.file)
@@ -154,8 +165,7 @@ def cmd_upload(args):
             or not (sub[ID].to_numpy() == tpl[ID].to_numpy()).all() or sub[TARGET].isna().any()):
         sys.exit(f"{path} does not match the template rows, IDs or columns, or has nulls. Not uploading.")
 
-    access, secret = minio_keys()
-    client = Minio(ENDPOINT, access_key=access, secret_key=secret, secure=True)
+    client = minio_client()
     bucket = args.bucket
     if not bucket:
         names = [b.name for b in client.list_buckets()]
